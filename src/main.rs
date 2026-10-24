@@ -7,7 +7,6 @@ const RATE_WORDS: usize = 17;
 const STATE_WORDS: usize = 25;
 const BLOCK_SIZE_BYTES: usize = 136;
 
-// ANSI barevné kódy pro konzoli
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
@@ -22,6 +21,7 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
     let rot1: u32 = 19;
     let rot2: u32 = 43;
 
+    // Absorbing Phase
     loop {
         let bytes_read = file.read(&mut buffer[..])?;
         total_bytes_read += bytes_read;
@@ -46,6 +46,7 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
         }
     }
 
+    // Handle empty file edge-case
     if total_bytes_read == 0 {
         let mut empty_padded = [0u8; BLOCK_SIZE_BYTES];
         empty_padded[0] |= 0x01;
@@ -53,6 +54,7 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
         absorb_block(&mut state, &empty_padded, rot1, rot2);
     }
 
+    // Squeezing Phase (XOF output generation)
     let target_byte_len = (target_char_len + 1) / 2;
     let mut output_bytes = Vec::with_capacity(target_byte_len);
 
@@ -89,6 +91,7 @@ fn absorb_block(state: &mut [u64; STATE_WORDS], block: &[u8; BLOCK_SIZE_BYTES], 
     permute_state(state, rot1, rot2);
 }
 
+// Core Cryptographic Permutation Function f (24 rounds of ARX)
 fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
     for round in 1..=24 {
         for i in 0..STATE_WORDS {
@@ -108,18 +111,17 @@ fn main() {
 
     if args.len() < 2 {
         println!("--- ITH-XOF Cryptographic Hash Engine (Rust CLI) ---");
-        println!("Výpočet:     Hash-File <cesta_k_souboru> [/počet_znaků]");
-        println!("Porovnání:   Hash-File <cesta_k_souboru> /check <očekávaný_hash>");
+        println!("Hash execution:  Hash-File <file_path> [/char_length]");
+        println!("Verification:    Hash-File <file_path> /check <expected_hash>");
         return;
     }
 
     let file_path = &args[1];
 
-    // Hledáme, zda kdekoli v argumentech existuje "/check" nebo "--check"
+    // Verification Mode Loop
     let check_mode = args.iter().any(|x| x == "/check" || x == "--check");
 
     if check_mode {
-        // Najdeme argument, který vypadá jako hash (je nejdelší a není to cesta ani /check)
         let mut expected_hash = String::new();
         for arg in args.iter().skip(2) {
             if arg != "/check" && arg != "--check" && arg.len() > expected_hash.len() {
@@ -131,7 +133,7 @@ fn main() {
         let target_len = expected_hash.len();
 
         if target_len == 0 {
-            eprintln!("{}Chyba: Nebyl zadán žádný hash pro porovnání.{}", COLOR_RED, COLOR_RESET);
+            eprintln!("{}Error: No target hash provided for validation.{}", COLOR_RED, COLOR_RESET);
             std::process::exit(1);
         }
 
@@ -141,20 +143,20 @@ fn main() {
                     println!("{} [OK] Hash matches! {}{}", COLOR_GREEN, calculated_hash, COLOR_RESET);
                 } else {
                     eprintln!("{} [FAIL] Hash mismatch! {}", COLOR_RED, COLOR_RESET);
-                    eprintln!("{}Očekávaný: {}{}", COLOR_CYAN, expected_hash, COLOR_RESET);
-                    eprintln!("{}Spočítaný: {}{}", COLOR_RED, calculated_hash, COLOR_RESET);
+                    eprintln!("{}Expected: {}{}", COLOR_CYAN, expected_hash, COLOR_RESET);
+                    eprintln!("{}Computed: {}{}", COLOR_RED, calculated_hash, COLOR_RESET);
                     std::process::exit(1);
                 }
             }
             Err(e) => {
-                eprintln!("{}Chyba při čtení souboru: {}{}", COLOR_RED, e, COLOR_RESET);
+                eprintln!("{}Error reading target file: {}{}", COLOR_RED, e, COLOR_RESET);
                 std::process::exit(1);
             }
         }
         return;
     }
 
-    // Režim 2: Klasický výpis hashe (volitelně s délkou)
+    // Standard Output Mode
     let mut char_len = 64;
     if args.len() >= 3 {
         let clean_len_str = args[2].trim_start_matches('/');
@@ -167,6 +169,6 @@ fn main() {
 
     match get_internal_tools_xof(file_path, char_len) {
         Ok(hash) => println!("{}", hash),
-        Err(e) => eprintln!("{}Chyba při čtení souboru: {}{}", COLOR_RED, e, COLOR_RESET),
+        Err(e) => eprintln!("{}Error reading target file: {}{}", COLOR_RED, e, COLOR_RESET),
     }
 }
