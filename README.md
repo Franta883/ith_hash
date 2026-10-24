@@ -8,11 +8,11 @@ Unlike traditional hashes, ITH-XOF functions as an **Extendable-Output Function 
 
 | Attribute | Specification | Cryptographic Benefit |
 | :--- | :--- | :--- |
-| **Core Design** | Sponge Construction | **Immune** to length-extension attacks. |
+| **Core Design** | Sponge Construction | **Immune** to current length-extension attacks. |
 | **State Width (b)** | 1600 bits (25 x 64-bit words) | Massive internal state space to prevent collisions. |
 | **Rate (r)** | 1088 bits (136 bytes) | High-speed data absorption per block iteration. |
-| **Capacity (c)** | 512 bits | Ensures **256-bit quantum-safe** security level. |
-| **Permutation (f)** | 24 rounds of custom ARX | Constant-time execution natively shielding against side-channel timing attacks. |
+| **Capacity (c)** | 512 bits | Ensures **256-bit** security level. |
+| **Permutation (f)** | 24 rounds of custom ARX |
 | **Padding Schema** | \(10^*1\) bitwise layout | Secure padding handling for multi-block data streams. |
 
 ## 🚀 Installation & Compilation
