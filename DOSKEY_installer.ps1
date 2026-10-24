@@ -1,5 +1,5 @@
 # ======================================================================
-# INTERNALTOOLS - HASH-FILE COMMAND AUTOMATED INSTALLER
+# INTERNALTOOLS - HASH-FILE COMMAND AUTOMATED INSTALLER (English Edition)
 # ======================================================================
 $ErrorActionPreference = "Stop"
 
@@ -8,6 +8,8 @@ $TargetDir = "C:\InternalTools"
 $TargetExe = "$TargetDir\ith_xof.exe"
 $SourceExe = "target\release\ith_hash.exe"
 $MacroFile = "C:\InternalTools\macro.txt" 
+$DesktopPath = [Environment]::GetFolderPath("Desktop")
+$ShortcutPath = "$DesktopPath\ITH-XOF Drag&Drop Hash.lnk"
 
 Write-Host "--- ITH-XOF Native Command Installer ---" -ForegroundColor Cyan
 
@@ -44,6 +46,17 @@ if (-not (Test-Path $MacroFile)) {
         Write-Host "[+] Appended the Hash-File interface command payload successfully." -ForegroundColor Green
     }
 }
+
+# NEW: Generate a Windows Desktop Drag & Drop Shortcut wrapper
+Write-Host "[*] Creating Drag & Drop desktop shortcut..." -ForegroundColor Yellow
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+$Shortcut.TargetPath = "cmd.exe"
+# Arguments launch CMD, run the hash engine on the dropped file, and wait for keypress
+$Shortcut.Arguments = "/k `"C:\InternalTools\ith_xof.exe`" `"%1`""
+$Shortcut.Description = "Drag and drop any file here to instantly compute its ITH-256 cryptographic hash."
+$Shortcut.Save()
+Write-Host "[+] Desktop shortcut successfully generated at: $ShortcutPath" -ForegroundColor Green
 
 Write-Host "`n[SUCCESS] Deployment phase finalized. Native 'Hash-File' command interface is live." -ForegroundColor Green
 Write-Host "Remember to reload your terminal environment macros (e.g. doskey /macrofile=$MacroFile)" -ForegroundColor Cyan
