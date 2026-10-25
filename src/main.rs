@@ -3,9 +3,10 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-const RATE_WORDS: usize = 17;
+// Sponge Parameters: b = 1600 bits (25 words), c = 1024 bits (16 words), r = 576 bits (9 words)
+const RATE_WORDS: usize = 9;
 const STATE_WORDS: usize = 25;
-const BLOCK_SIZE_BYTES: usize = 136;
+const BLOCK_SIZE_BYTES: usize = 72;
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
@@ -91,34 +92,45 @@ fn absorb_block(state: &mut [u64; STATE_WORDS], block: &[u8; BLOCK_SIZE_BYTES], 
     permute_state(state, rot1, rot2);
 }
 
-// Core Cryptographic Permutation Function f (24 rounds of ARX + Shift-Shuffle)
+// Core Cryptographic Permutation Function f (24 rounds of Fixed-Degree Logical Operations + Shift-Shuffle)
 fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
     for round in 1..=24 {
-        // 1. ARX Round Step with inter-word mixing
+        // 1a. Linear Logical Diffusion (Algebraic Degree = 1)
+        let mut parity = 0u64;
+        for i in 0..STATE_WORDS {
+            parity ^= state[i];
+        }
+        let theta_mix = parity.rotate_left(rot1) ^ parity.rotate_left(rot2);
         for i in 0..STATE_WORDS {
             let j = (i + 7) % STATE_WORDS;
-            state[i] = state[i].wrapping_add(state[j]);
-            state[j] = (state[j] ^ state[i]).rotate_left(rot1);
-            state[i] = state[i].rotate_left(32).wrapping_add(state[j]);
-            state[j] = (state[j] ^ state[i]).rotate_left(rot2);
+            state[i] ^= theta_mix ^ state[j].rotate_left(rot1);
+            state[j] ^= state[i].rotate_left(32) ^ state[j].rotate_left(rot2);
         }
 
-        // 2. FIXED: Shift-Shuffle Layer with perfect bijection (7) and carry-chain disruption
+        // 1b. Non-Linear Quadratic Chi Layer (Fixed Algebraic Degree = 2)
+        // Uses purely logical NOT (!), AND (&), and XOR (^) across the 25-word state
+        let mut chi_state = [0u64; STATE_WORDS];
+        for i in 0..STATE_WORDS {
+            let s1 = state[(i + 1) % STATE_WORDS];
+            let s2 = state[(i + 2) % STATE_WORDS];
+            chi_state[i] = state[i] ^ ((!s1) & s2);
+        }
+        *state = chi_state;
+
+        // 2. Shift-Shuffle Layer with bijection (7) and word-specific bit rotations (Algebraic Degree = 1)
         let mut shuffled_state = [0u64; STATE_WORDS];
         for i in 0..STATE_WORDS {
             let target_index = (i * 7) % STATE_WORDS;
-            
-            // FIX: Unikátní bitová rotace pro každé slovo (např. i * 3 + 1), 
-            // která kompletně roztříští carry chains modulárního sčítání.
             let shift_amount = ((i * 3) + 1) % 64;
             shuffled_state[target_index] = state[i].rotate_left(shift_amount as u32);
         }
         *state = shuffled_state;
-        
-        // 3. Avalanche Symmetry Disruption (Round constant injection)
-        let round_constant = (round as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        for i in 0..STATE_WORDS { 
-            state[i] ^= round_constant; 
+
+        // 3. Avalanche Symmetry Disruption (Purely logical round constant injection)
+        let r = round as u64;
+        let round_constant = 0x9e3779b97f4a7c15u64.rotate_left(round as u32) ^ (r << 32) ^ (!r);
+        for i in 0..STATE_WORDS {
+            state[i] ^= round_constant ^ (i as u64);
         }
     }
 }
