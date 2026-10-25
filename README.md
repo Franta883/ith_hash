@@ -1,6 +1,6 @@
-# ITH-XOF: InternalTools Cryptographic Hash & Extendable-Output Function (v2.0.0) scr/bin/ith_standard.rs
+# ITH-XOF: InternalTools Cryptographic Hash & Extendable-Output Function (v2.2.0) standard scr/bin/ith_standard.rs
 
-**ITH-XOF v2.0.0** is an ultra-secure, math-hardened, next-generation cryptographic hash engine designed in Rust. Moving away from standard ARX architectures, version 2.0.0 implements a strict **Fixed-Degree Logically Non-Linear Permutation** combined with a full **Sponge Construction** framework.
+**ITH-XOF v2.2.0 standard** is an ultra-secure, math-hardened, next-generation cryptographic hash engine designed in Rust. Moving away from standard ARX architectures, version 2.0.0 implements a strict **Fixed-Degree Logically Non-Linear Permutation** combined with a full **Sponge Construction** framework.
 
 The internal permutation loop enforces an exact algebraic degree of 2 per round over \(\mathbb{F}_2\), completely neutralizing algebraic SAT-solvers, linear/differential cryptanalysis, and quantum-preimage optimizations.
 
@@ -51,9 +51,9 @@ This project is open-source under the MIT License.
 
 ________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________
 
-# ITH-XOF: Ultra-High Capacity Cryptographic Engine (v2.2.0) scr/bin/ith_paranoid.rs
+# ITH-XOF: Ultra-High Capacity Cryptographic Engine (v2.2.0) paranoid scr/bin/ith_paranoid.rs
 
-**ITH-XOF v2.2.0** is an extreme-parameter variant of the ITH cryptographic family. Designed specifically for environments that demand maximum theoretical security bounds, this version forces a highly aggressive **1536-bit Capacity** layout within a 1600-bit state plane. 
+**ITH-XOF v2.2.0 paranoid** is an extreme-parameter variant of the ITH cryptographic family. Designed specifically for environments that demand maximum theoretical security bounds, this version forces a highly aggressive **1536-bit Capacity** layout within a 1600-bit state plane. 
 
 By shrinking the data ingestion window down to a single 64-bit word ($r = 64$), this engine maximizes mathematical entropy density, establishing a **768-bit classical** and **384-bit quantum-safe** collision resistance boundary.
 
