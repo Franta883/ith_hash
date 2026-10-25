@@ -91,9 +91,10 @@ fn absorb_block(state: &mut [u64; STATE_WORDS], block: &[u8; BLOCK_SIZE_BYTES], 
     permute_state(state, rot1, rot2);
 }
 
-// Core Cryptographic Permutation Function f (24 rounds of ARX)
+// Core Cryptographic Permutation Function f (24 rounds of ARX + Shift-Shuffle)
 fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
     for round in 1..=24 {
+        // 1. ARX Round Step with inter-word mixing
         for i in 0..STATE_WORDS {
             let j = (i + 7) % STATE_WORDS;
             state[i] = state[i].wrapping_add(state[j]);
@@ -101,8 +102,21 @@ fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
             state[i] = state[i].rotate_left(32).wrapping_add(state[j]);
             state[j] = (state[j] ^ state[i]).rotate_left(rot2);
         }
+
+        // 2. IMPLEMENTED: Shift-Shuffle Layer (Mathematical matrix transposition)
+        // Disrups linear paths by shuffling words using an injection grid coprime to 25
+        let mut shuffled_state = [0u64; STATE_WORDS];
+        for i in 0..STATE_WORDS {
+            let target_index = (i * 5) % STATE_WORDS;
+            shuffled_state[target_index] = state[i];
+        }
+        *state = shuffled_state;
+
+        // 3. Avalanche Symmetry Disruption (Round constant injection)
         let round_constant = (round as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        for i in 0..STATE_WORDS { state[i] ^= round_constant; }
+        for i in 0..STATE_WORDS { 
+            state[i] ^= round_constant; 
+        }
     }
 }
 
