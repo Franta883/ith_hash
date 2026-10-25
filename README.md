@@ -26,7 +26,7 @@ The compiled binary will be located at `target/release/ith_hash.exe`.
 
 ## 💻 CLI Usage
 
-The engine supports native file hashing, arbitrary length stream squeezing, and automated verification modes. YOU HAVE TO RUN THE INSTALLER FOR THE DOSKEY MACRO TO WORK.
+The engine supports native file hashing, arbitrary length stream squeezing, and automated verification modes.
 
 ### 1. Standard Hashing (Default 64 characters / 256 bits)
 ```bash
@@ -45,7 +45,7 @@ ith_hash.exe "C:\path\to\file.ext" /check <hex_string>
 ```
 
 ### 🎛️ Windows Command Line Integration (Doskey)
-To integrate it directly into your command prompt environment as a system native command, add this alias to your macro file:
+To integrate it directly into your command prompt environment as a system native command, add this alias to your macro file (or run the ps1 installer):
 ```text
 Hash-File=C:\InternalTools\ith_xof.exe \$*
 ```
