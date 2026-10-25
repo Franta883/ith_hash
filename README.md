@@ -4,8 +4,6 @@
 
 The internal permutation loop enforces an exact algebraic degree of 2 per round over \(\mathbb{F}_2\), completely neutralizing algebraic SAT-solvers, linear/differential cryptanalysis, and quantum-preimage optimizations.
 
-> ⚠️ **YOU HAVE TO RUN THE INSTALLER FOR THE DOSKEY MACRO TO WORK.**
-
 ## 🛡️ Security Architecture & Parameter Layout
 
 | Attribute | Specification | Cryptographic & Mathematical Benefit |
