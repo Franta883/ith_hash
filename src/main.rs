@@ -3,9 +3,10 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-const RATE_WORDS: usize = 9;
-const STATE_WORDS: usize = 25;
-const BLOCK_SIZE_BYTES: usize = 72;
+// Sponge Parameters: b = 1600 bits (25 words), c = 1536 bits (24 words), r = 64 bits (1 word)
+const RATE_WORDS: usize = 1;          // r = 64 bits
+const STATE_WORDS: usize = 25;        // b = 1600 bits
+const BLOCK_SIZE_BYTES: usize = 8;    // = RATE_WORDS * 8
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
@@ -18,12 +19,16 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
     let mut buffer = [0u8; BLOCK_SIZE_BYTES];
     let mut total_bytes_read = 0;
 
+    let rot1: u32 = 19;
+    let rot2: u32 = 43;
+
+    // Absorbing Phase
     loop {
         let bytes_read = file.read(&mut buffer[..])?;
         total_bytes_read += bytes_read;
 
         if bytes_read == BLOCK_SIZE_BYTES {
-            absorb_block(&mut state, &buffer);
+            absorb_block(&mut state, &buffer, rot1, rot2);
         } else {
             let mut padded_block = [0u8; BLOCK_SIZE_BYTES];
             padded_block[..bytes_read].copy_from_slice(&buffer[..bytes_read]);
@@ -31,24 +36,26 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
 
             if bytes_read < BLOCK_SIZE_BYTES - 1 {
                 padded_block[BLOCK_SIZE_BYTES - 1] |= 0x80;
-                absorb_block(&mut state, &padded_block);
+                absorb_block(&mut state, &padded_block, rot1, rot2);
             } else {
-                absorb_block(&mut state, &padded_block);
+                absorb_block(&mut state, &padded_block, rot1, rot2);
                 let mut final_block = [0u8; BLOCK_SIZE_BYTES];
                 final_block[BLOCK_SIZE_BYTES - 1] |= 0x80;
-                absorb_block(&mut state, &final_block);
+                absorb_block(&mut state, &final_block, rot1, rot2);
             }
             break;
         }
     }
 
+    // Handle empty file edge-case
     if total_bytes_read == 0 {
         let mut empty_padded = [0u8; BLOCK_SIZE_BYTES];
         empty_padded[0] |= 0x01;
         empty_padded[BLOCK_SIZE_BYTES - 1] |= 0x80;
-        absorb_block(&mut state, &empty_padded);
+        absorb_block(&mut state, &empty_padded, rot1, rot2);
     }
 
+    // Squeezing Phase (XOF output generation)
     let target_byte_len = (target_char_len + 1) / 2;
     let mut output_bytes = Vec::with_capacity(target_byte_len);
 
@@ -63,7 +70,7 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
             }
         }
         if output_bytes.len() < target_byte_len {
-            permute_state(&mut state);
+            permute_state(&mut state, rot1, rot2);
         }
     }
 
@@ -75,52 +82,33 @@ pub fn get_internal_tools_xof<P: AsRef<Path>>(file_path: P, target_char_len: usi
     Ok(digest)
 }
 
-fn absorb_block(state: &mut [u64; STATE_WORDS], block: &[u8; BLOCK_SIZE_BYTES]) {
+fn absorb_block(state: &mut [u64; STATE_WORDS], block: &[u8; BLOCK_SIZE_BYTES], rot1: u32, rot2: u32) {
     for i in 0..RATE_WORDS {
         let start = i * 8;
         let mut word_bytes = [0u8; 8];
         word_bytes.copy_from_slice(&block[start..start + 8]);
         state[i] ^= u64::from_le_bytes(word_bytes);
     }
-    permute_state(state);
+    permute_state(state, rot1, rot2);
 }
 
-// Core Cryptographic Permutation Function f (v2.1.0 - Entropy Guard)
-fn permute_state(state: &mut [u64; STATE_WORDS]) {
-    // 25-word specific rotation constants to maximize intra-word bit diffusion (Rho Layer)
-    let rho_constants: [u32; 25] = [
-        0,  1,  62, 28, 27, 
-        36, 44, 6,  55, 20, 
-        3,  10, 43, 25, 39, 
-        41, 45, 15, 21, 8, 
-        18, 2,  61, 56, 14
-    ];
-
+// Core Cryptographic Permutation Function f (24 rounds of Fixed-Degree Logical Operations + Shift-Shuffle)
+fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
     for round in 1..=24 {
-        // 1. Fully Bijective Linear Theta Layer (Algebraic Degree = 1)
-        // Computes 5-word block parities to uniformly distribute entropy without any kernel cancellation
-        let mut c_parity = [0u64; 5];
-        for i in 0..5 {
-            c_parity[i] = state[i] ^ state[i + 5] ^ state[i + 10] ^ state[i + 15] ^ state[i + 20];
-        }
-        
-        for i in 0..5 {
-            let m_mix = c_parity[(i + 4) % 5] ^ c_parity[(i + 1) % 5].rotate_left(1);
-            for j in 0..5 {
-                state[i + j * 5] ^= m_mix;
-            }
-        }
-
-        // 2. Intra-word Diffusion (Rho Layer) combined with Shift-Shuffle (Pi Layer)
-        // Disrupts linear structures and carry chains across all bit positions
-        let mut advanced_state = [0u64; STATE_WORDS];
+        // 1a. Linear Logical Diffusion (Algebraic Degree = 1)
+        let mut parity = 0u64;
         for i in 0..STATE_WORDS {
-            let target_index = (i * 7) % STATE_WORDS;
-            advanced_state[target_index] = state[i].rotate_left(rho_constants[i]);
+            parity ^= state[i];
         }
-        *state = advanced_state;
+        let theta_mix = parity.rotate_left(rot1) ^ parity.rotate_left(rot2);
+        for i in 0..STATE_WORDS {
+            let j = (i + 7) % STATE_WORDS;
+            state[i] ^= theta_mix ^ state[j].rotate_left(rot1);
+            state[j] ^= state[i].rotate_left(32) ^ state[j].rotate_left(rot2);
+        }
 
-        // 3. Non-Linear Quadratic Chi Layer (Fixed Algebraic Degree = 2)
+        // 1b. Non-Linear Quadratic Chi Layer (Fixed Algebraic Degree = 2)
+        // Uses purely logical NOT (!), AND (&), and XOR (^) across the 25-word state
         let mut chi_state = [0u64; STATE_WORDS];
         for i in 0..STATE_WORDS {
             let s1 = state[(i + 1) % STATE_WORDS];
@@ -129,13 +117,20 @@ fn permute_state(state: &mut [u64; STATE_WORDS]) {
         }
         *state = chi_state;
 
-        // 4. Fully Non-Symmetrical Round Constant Injection (Degree = 1)
-        // Breaks high-order word symmetry completely by spreading entropy across the entire 64-bit plane
-        let r = round as u64;
-        let base_constant = 0x9e3779b97f4a7c15u64.rotate_left(round as u32) ^ (r << 48) ^ (!r);
+        // 2. Shift-Shuffle Layer with bijection (7) and word-specific bit rotations (Algebraic Degree = 1)
+        let mut shuffled_state = [0u64; STATE_WORDS];
         for i in 0..STATE_WORDS {
-            let unique_word_salt = (i as u64).wrapping_mul(0xbf58476d1ce4e5b9u64).rotate_left(i as u32);
-            state[i] ^= base_constant ^ unique_word_salt;
+            let target_index = (i * 7) % STATE_WORDS;
+            let shift_amount = ((i * 3) + 1) % 64;
+            shuffled_state[target_index] = state[i].rotate_left(shift_amount as u32);
+        }
+        *state = shuffled_state;
+
+        // 3. Avalanche Symmetry Disruption (Purely logical round constant injection)
+        let r = round as u64;
+        let round_constant = 0x9e3779b97f4a7c15u64.rotate_left(round as u32) ^ (r << 32) ^ (!r);
+        for i in 0..STATE_WORDS {
+            state[i] ^= round_constant ^ (i as u64);
         }
     }
 }
@@ -151,6 +146,8 @@ fn main() {
     }
 
     let file_path = &args[1];
+
+    // Verification Mode Loop
     let check_mode = args.iter().any(|x| x == "/check" || x == "--check");
 
     if check_mode {
@@ -188,6 +185,7 @@ fn main() {
         return;
     }
 
+    // Standard Output Mode
     let mut char_len = 64;
     if args.len() >= 3 {
         let clean_len_str = args[2].trim_start_matches('/');
