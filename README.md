@@ -34,24 +34,18 @@ The engine supports native file hashing, arbitrary length stream squeezing, and 
 
 ### 1. Standard Hashing (Default 64 characters / 256 bits)
 ```bash
-Hash-File "C:\path\to\file.ext"
+ith_standard.exe "C:\path\to\file.ext"
 ```
 
 ### 2. Extendable-Output Squeezing (e.g., 500 characters)
 ```bash
-Hash-File "C:\path\to\file.ext" 500
+ith_standard.exe "C:\path\to\file.ext" 500
 ```
 
 ### 3. Automated Verification Mode (`/check`)
 Automatically scales the internal XOF squeezing engine based on the input string length and verifies integrity:
 ```bash
-Hash-File "C:\path\to\file.ext" /check <hex_string>
-```
-
-### 🎛️ Windows Command Line Integration (Doskey)
-To integrate it directly into your command prompt environment as a system native command, run the automated `DOSKEY_installer.ps1` PowerShell script. It maps the following native console interface:
-```text
-Hash-File=C:\InternalTools\ith_xof.exe \$*
+ith_standard.exe "C:\path\to\file.ext" /check <hex_string>
 ```
 
 ## 📄 License
@@ -94,17 +88,17 @@ The engine supports native file hashing, arbitrary length stream squeezing, and 
 
 ### 1. Standard Hashing
 ```bash
-ith_hash.exe "C:\(\path\to\file.\)ext"
+ith_paranoid.exe "C:\(\path\to\file.\)ext"
 ```
 
 ### 2. Extendable-Output Squeezing (e.g., 500 characters)
 ```bash
-ith_hash.exe "C:\(\path\to\file.\)ext" 500
+ith_paranoid.exe "C:\(\path\to\file.\)ext" 500
 ```
 
 ### 3. Automated Verification Mode (`/check`)
 ```bash
-ith_hash.exe "C:\(\path\to\file.\)ext" /check <hex_string>
+ith_paranoid.exe "C:\(\path\to\file.\)ext" /check <hex_string>
 ```
 
 ## 📄 License
