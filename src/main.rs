@@ -103,14 +103,14 @@ fn permute_state(state: &mut [u64; STATE_WORDS], rot1: u32, rot2: u32) {
             state[j] = (state[j] ^ state[i]).rotate_left(rot2);
         }
 
-        // 2. IMPLEMENTED: Shift-Shuffle Layer (Mathematical matrix transposition)
-        // Disrups linear paths by shuffling words using an injection grid coprime to 25
-        let mut shuffled_state = [0u64; STATE_WORDS];
-        for i in 0..STATE_WORDS {
-            let target_index = (i * 5) % STATE_WORDS;
-            shuffled_state[target_index] = state[i];
-        }
-        *state = shuffled_state;
+// 2. FIXED: Shift-Shuffle Layer with perfect bijection using coprime grid (7)
+let mut shuffled_state = [0u64; STATE_WORDS];
+for i in 0..STATE_WORDS {
+    // 7 is coprime to 25, ensuring maximum bit diffusion and preventing algebraic saturation
+    let target_index = (i * 7) % STATE_WORDS;
+    shuffled_state[target_index] = state[i];
+}
+*state = shuffled_state;
 
         // 3. Avalanche Symmetry Disruption (Round constant injection)
         let round_constant = (round as u64).wrapping_mul(0x9e3779b97f4a7c15);
