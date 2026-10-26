@@ -19,22 +19,30 @@ Both engines implement an advanced 24-round permutation logic ensuring perfect s
 * **Non-Linear Chi Layer ($\chi$):** A quadratic bit-mixing mapping maintaining an algebraic degree of exactly 2 per round.
 * **Diffusion Layer ($\rho / \pi$):** Transposes words combined with 25 distinct bit rotations to shatter linear carry chains.
 
-## 💻 Compilation & Deployment
+## 🚀 Compilation & Execution
 
-Compile both standalone executables simultaneously using Cargo:
+To maintain maximum repository trust and transparency, this project does not distribute pre-compiled binaries. You can compile both standalone executables simultaneously from source code using Cargo:
+
 ```bash
 cargo build --release
 ```
 
-💻 CLI Usage
-The engine supports native file hashing, arbitrary length stream squeezing, and automated verification modes. (Note: Replace ith_standard with ith_paranoid if you downloaded the paranoid version.)
+After compilation, the optimized binaries will be available at:
+* `target/release/ith_standard.exe`
+* `target/release/ith_paranoid.exe`
 
-1. Standard Hashing (Default 64 characters / 256 bits)
-ith_standard.exe "C:\path\to\file.ext"
-2. Extendable-Output Squeezing (e.g., 500 characters)
-ith_standard.exe "C:\path\to\file.ext" 500
-3. Automated Verification Mode (/check)
-Automatically scales the internal XOF squeezing engine based on the input string length and verifies integrity:
+### CLI Usage Examples:
 
-ith_standard.exe "C:\path\to\file.ext" /check <hex_string>
+```bash
+# Standard hashing (64 characters / 256 bits)
+target/release/ith_standard.exe "C:\(\path\to\file.\)ext"
 
+# Paranoid hashing with custom XOF length squeezing (e.g., 500 characters)
+target/release/ith_paranoid.exe "C:\(\path\to\file.\)ext" 500
+
+# Automated integrity check mode
+target/release/ith_standard.exe "C:\(\path\to\file.\)ext" /check <hex_string>
+```
+
+## 📄 License
+This project is open-source under the MIT License.
