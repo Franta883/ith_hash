@@ -21,7 +21,7 @@ Both engines implement an advanced 24-round permutation logic ensuring perfect s
 
 ## 🚀 Compilation & Execution
 
-To maintain maximum repository trust and transparency, this project does not distribute pre-compiled binaries. You can compile both standalone executables simultaneously from source code using Cargo:
+You can compile both standalone executables simultaneously from source code using Cargo:
 
 ```bash
 cargo build --release
@@ -31,7 +31,7 @@ After compilation, the optimized binaries will be available at:
 * `target/release/ith_standard.exe`
 * `target/release/ith_paranoid.exe`
 
-### CLI Usage Examples:
+### CLI Usage Examples (Note: The DOSKEY_installer.ps1 was retired for repository trust and complexity):
 
 ```bash
 # Standard hashing (64 characters / 256 bits)
