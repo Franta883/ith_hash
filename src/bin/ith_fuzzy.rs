@@ -127,7 +127,7 @@ pub fn get_ctps_fuzzy_hash<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
     Ok(format!("{}:{}:{}:{}", b, sig_b, sig_2b, entropy_anchors))
 }
 
-// OPRAVENO: Správná, typově bezpečná alokace a inicializace 2D vektoru pro Levenshtein
+// FIX
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let v1: Vec<char> = s1.chars().collect();
     let v2: Vec<char> = s2.chars().collect();
@@ -136,7 +136,7 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     
     let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
     
-    // Správné plnění nultého sloupce a nultého řádku
+    // FIX
     for i in 0..=len1 { dp[i][0] = i; }
     for j in 0..=len2 { dp[0][j] = j; }
     
