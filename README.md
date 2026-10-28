@@ -1,4 +1,4 @@
-# ITH-Hash Suite: Cryptographic & Forensic Framework (v2.3.1)
+# ITH-Hash Suite: Hash family (v2.3.1)
 
 **ITH-Hash Suite** is a unified mathematical framework written in Rust, offering two distinct cryptographic Extendable-Output Functions (XOF) alongside a context-triggered piecewise fuzzy hashing tool. This multi-binary suite provides developers and forensic analysts with an optimized balance of speed, post-quantum security, and file-similarity mapping.
 
@@ -27,7 +27,7 @@ The Context-Triggered Piecewise Signature (CTPS) engine shifts bounds dynamicall
 
 ## 🚀 Native Compilation & Quickstart
 
-To preserve source verification and ensure absolute repository trust, this suite does not distribute pre-compiled binaries. Compile all standalone executables simultaneously from source code using Cargo:
+Download The Ready Executables, Or Compile all standalone executables simultaneously from source code using Cargo:
 
 ```bash
 cargo build --release
