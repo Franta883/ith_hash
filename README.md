@@ -1,47 +1,60 @@
-# ITH-XOF: Cryptographic Hash Framework (v2.2.0)
+# ITH-Hash Suite: Cryptographic & Forensic Framework (v2.3.1)
 
-**ITH-XOF** is a mathematical, multi-binary cryptographic hash suite built in Rust. Moving away from traditional ARX trapdoors, it features a **Fixed-Degree Logically Non-Linear Permutation Layer** mapped over a 1600-bit state plane. The suite provides two independent binaries designed to balance performance against extreme security bounds.
+**ITH-Hash Suite** is a unified mathematical framework written in Rust, offering two distinct cryptographic Extendable-Output Functions (XOF) alongside a context-triggered piecewise fuzzy hashing tool. This multi-binary suite provides developers and forensic analysts with an optimized balance of speed, post-quantum security, and file-similarity mapping.
 
-## 📊 Variant Comparison & Cryptographic Trade-offs
+## 📊 Core Engine Comparison & Design Intents
 
-| Parameter | Standard Edition (`src/bin/ith_standard.rs`) | Paranoid Edition (`src/bin/ith_paranoid.rs`) |
-| :--- | :--- | :--- |
-| **Capacity ($c$)** | 1024 bits (16 words) | 1536 bits (24 words) |
-| **Rate ($r$)** | 576 bits (72 bytes) | 64 bits (8 bytes) |
-| **Classical Security** | 512-bit Pre-image / 256-bit Collision | 768-bit Pre-image / 384-bit Collision |
-| **Quantum Resistance** | 256-bit Grover-safe bound | 384-bit Grover-immune plane |
-| **Performance Profile** | Fast throughput via multi-word block ingestion. | Low throughput due to ultra-high capacity squeezing. |
+| Binary Target | Engine Variant | Core Cryptographic Purpose | Core Architectural Mechanism |
+| :--- | :--- | :--- | :--- |
+| `ith_standard` | **Standard Cryptographic XOF** | High-throughput data signing with robust quantum resistance (256-bit safe bound) and **Extendable-Output Squeezing**. | 24-round permutation using a bijective Theta parity layer and a fixed quadratic Chi logic ($c = 1024$ bits). |
+| `ith_paranoid` | **Paranoid Cryptographic XOF** | Ultra-high capacity parameter structure for maximum proof against multi-property quantum speedups with **Extendable-Output Squeezing**. | Maximum capacity configuration forcing tight 8-byte data ingestion segments ($c = 1536$ bits). |
+| `ith_fuzzy` | **CTPS Forensic Hashing** | Similarity matching and rolling-window heuristic analysis to spot modified or obfuscated binaries. | 3-tiered pipeline utilizing an Adler-32 rolling hash, FNV-1a feature compression, and a Shannon Entropy overlay. |
 
-## 🧠 Architectural Overview
+## 🧠 Permutation & Slicing Architecture
 
-Both engines implement an advanced 24-round permutation logic ensuring perfect state bijection:
-* **Linear Theta Layer ($\theta$):** A column-parity mapping that forces non-singular, uniform entropy distribution.
-* **Non-Linear Chi Layer ($\chi$):** A quadratic bit-mixing mapping maintaining an algebraic degree of exactly 2 per round.
-* **Diffusion Layer ($\rho / \pi$):** Transposes words combined with 25 distinct bit rotations to shatter linear carry chains.
+### 1. Cryptographic XOF Engines (`ith_standard` & `ith_paranoid`)
+Both cryptographic implementations completely replace older ARX layers with mathematically sound, fixed-degree logical blocks to ensure uniform distribution and thwart SAT-solver cryptanalysis. Output generation utilizes a dedicated **Squeezing Phase (XOF)**, allowing the user to request an arbitrarily long hex digest:
+* **Linear Theta Layer ($\theta$):** A column-parity vector transformation ensuring 100% invertible state mappings.
+* **Non-Linear Chi Layer ($\chi$):** An optimized mapping maintaining an exact algebraic degree of 2 per iteration.
+* **Diffusion Layer ($\rho / \pi$):** Transposes and rotates individual words to prevent carry-chain linearity leakage.
+* **Extendable Output (XOF):** If the requested length exceeds the rate $r$, the internal state runs additional permutation cycles natively, squeezing unlimited unique bits from the internal state layout.
 
-## 🚀 Compilation & Execution
+### 2. Forensic Engine (`ith_fuzzy`)
+The Context-Triggered Piecewise Signature (CTPS) engine shifts bounds dynamically based on content matching:
+* **Dynamic Chunking:** Triggers data-stream cutting only when the sliding Adler-32 window hits a specific modulo marker, neutralizing file-size shift deficiencies.
+* **Dual-Scale Ingestion:** Operates parallel tracking at block size $B$ and $2B$ to catch structural matches if sizes shift significantly.
+* **Entropy Anchor:** Factorizes localized Shannon entropy to block evasion techniques that merely scramble chunk locations.
 
-You can compile both standalone executables simultaneously from source code using Cargo:
+## 🚀 Native Compilation & Quickstart
+
+To preserve source verification and ensure absolute repository trust, this suite does not distribute pre-compiled binaries. Compile all standalone executables simultaneously from source code using Cargo:
 
 ```bash
 cargo build --release
 ```
 
-After compilation, the optimized binaries will be available at:
+Optimized targets are available within your build root environment at:
 * `target/release/ith_standard.exe`
 * `target/release/ith_paranoid.exe`
+* `target/release/ith_fuzzy.exe`
 
-### CLI Usage Examples (Note: The DOSKEY_installer.ps1 was retired for repository trust and complexity):
+### Standard Execution Snippets:
 
 ```bash
-# Standard hashing (64 characters / 256 bits)
-target/release/ith_standard.exe "C:\(\path\to\file.\)ext"
+# Generate Standard 256-bit secure XOF hash (Default 64 characters)
+target/release/ith_standard.exe "path/to/binary.dat"
 
-# Paranoid hashing with custom XOF length squeezing (e.g., 500 characters)
-target/release/ith_paranoid.exe "C:\(\path\to\file.\)ext" 500
+# Squeeze custom long XOF digest string using the Standard engine (e.g., 500 characters)
+target/release/ith_standard.exe "path/to/binary.dat" 500
 
-# Automated integrity check mode
-target/release/ith_standard.exe "C:\(\path\to\file.\)ext" /check <hex_string>
+# Squeeze extreme post-quantum XOF digest string using the Paranoid engine (e.g., 1000 characters)
+target/release/ith_paranoid.exe "path/to/binary.dat" 1000
+
+# Verify file state using Standard automated check mode
+target/release/ith_standard.exe "path/to/binary.dat" /check <hex_string>
+
+# Compute CTPS fuzzy forensic signature for similarity deployment
+target/release/ith_fuzzy.exe "path/to/binary.dat"
 ```
 
 ## 📄 License
