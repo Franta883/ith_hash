@@ -1,6 +1,6 @@
-# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v3.0.0)
+# ITH-Hash Family: Cryptographic, Forensic & Spectral Framework (v3.0.0)
 
-**ITH-Hash Suite** is a unified mathematical framework written in Rust. Moving away from standard legacy architectures, it provides a comprehensive zero-dependency toolkit for post-quantum signatures, extendable squeezes, parallel tree integrity, and advanced binary similarity topo-mapping.
+**ITH-Hash Family** is a unified mathematical framework written in Rust. Moving away from standard/simple legacy architectures, it provides a comprehensive zero-dependency toolkit for post-quantum signatures, extendable squeezes, parallel tree integrity, and advanced binary similarity topo-mapping.
 
 ## 📊 Core Engine Comparison & Design Intents
 
@@ -12,9 +12,9 @@
 | `ith_metadata` | **Structural Features Analyzer** | Generates order-independent invariant structural hashes and detects compiler origin language over Windows PE and Linux ELF binaries. | Pure byte-scanning COFF/IAT/EAT vector table extraction linked into a custom standalone RFC 6234 SHA-256 engine. |
 | `ith_spectral` | **Spectral-Lattice Hash (SELH v2)** | Post-quantum hybrid hashing providing decoupled noiseless thermometer topology mapping ($<2\%$ strict Hamming distance stability). | Discrete Number-Theoretic Transform (NTT) with separate high-volatile LWE noisy roots and rigid Edwards curve curve sponges. |
 
-## 🚀 Native Compilation & Quickstart
+##  Native Compilation & Quickstart
 
-Compile all standalone executables simultaneously from source code using Cargo:
+Download directly from the releases, or compile all standalone executables simultaneously from source code using Cargo:
 
 ```bash
 cargo build --release
