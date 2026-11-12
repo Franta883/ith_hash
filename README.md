@@ -1,4 +1,4 @@
-# ITH-Hash Family: Cryptographic, Forensic & Spectral Framework (v3.0.0)
+# ITH-Hash Family: Cryptographic, Forensic & Spectral Framework (v3.1.0)
 
 **ITH-Hash Family** is a unified mathematical framework written in Rust. Moving away from standard/simple legacy architectures, it provides a comprehensive zero-dependency toolkit for post-quantum signatures, extendable squeezes, parallel tree integrity, and advanced binary similarity topo-mapping.
 
