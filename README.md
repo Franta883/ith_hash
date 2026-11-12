@@ -51,3 +51,6 @@ target/release/ith_spectral.exe "path/to/binary.exe"
 
 ## 📄 License
 This project is open-source under the MIT License.
+
+### What´s new
+- Critical bug and vulnerability fixes
