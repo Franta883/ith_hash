@@ -1,244 +1,260 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const MAX_SIGNATURE_LEN: usize = 64;
+const STREAM_BUF_SIZE: usize = 64 * 1024;
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
 
-// A pre-computed, high-entropy random lookup matrix for Gear Hash (mapping 0..=255 to u64)
-// A fully populated, high-entropy random lookup matrix for Gear Hash (Exactly 256 values mapped from 0..=255 to u64)
-const GEAR_MATRIX: [u64; 256] = [
-    0x192d24241ab7e57c, 0xef2688e100dc8dfa, 0x76251b5c46440b84, 0x6e8f4cb7cb95a315,
-    0xf8da8d7cb27a206a, 0x2289c8a95610ec50, 0x93306c59d95be093, 0xcd6bbd1d575dfa8e,
-    0x2b8004fcf189da59, 0xb8be3f3da33cf852, 0xe00d0bc5d9f0ab56, 0x61a7dc2eb76aa8a8,
-    0x3ca2fa6b21bc0b53, 0x9e246cf7be7ff10a, 0x09da563d76eef5ee, 0xbe2b92a2a7cc33e1,
-    0x401df4e43e5c949c, 0xb1b0f55fb9ef775a, 0x7d02b3dfbb910609, 0x8a9bf3df1c808f90,
-    0x616cd4fc28b7eec9, 0xa19a9b1c7dc41c2d, 0x3d39ec5d36e2f171, 0x5b3f1c1f54cfadba,
-    0xbef5e1dc7f30df00, 0x981eeefbe1a700da, 0xc19bb3ea1901cbcc, 0xbc3cbafca7aef00d,
-    0x4f1b2dfce9cf2aef, 0xad5deecda9ea53ee, 0x99da1d2b8feeb4da, 0x4f3ce17f9daeb3de,
-    0x1c3a6fec5af1a72d, 0xd00aa8fd5be9fca8, 0x1da5bb3dfc9fe0dd, 0xaa2dceef5ea2d8fb,
-    0xb3c0eeefda2beea7, 0x5df3cecf5a2ce01d, 0x2d1ebcf3ef2ce10d, 0x7a2cefdc3be1ae7d,
-    0x93ce3fa9dcbe76a1, 0x1fbe32dfcf20ef22, 0x4e6be31da9fbb3ae, 0xbc3defda9cb32ea9,
-    0x96ef2cda9fb0eb3d, 0x7cf1dfa34ee9cae1, 0x3cf3ce5b1fce6ba1, 0x9ef1b3adbe9cf2de,
-    0xdfbe3c1da0fed00a, 0x5ae3cd2be09cf2de, 0xfa3be20ca0be0fa2, 0x3be1cd9fa2be0eb1,
-    0x19aef3bd7a0fbe2d, 0x6cf2de30afbe0cd1, 0x8fb3deac70fbe0d3, 0xf02be310adfe20fa,
-    0x3be02da5be1c6ba1, 0xcbe310dfa30fe2de, 0x2be310ca7fe12fbe, 0x4be1cd2ae30fed1c,
-    0x9ef310da7fe023be, 0x1be0ce2de0fbe210, 0xfce30f2ae10fbe3d, 0x9fe302be10adfe2c,
-    0x40df21fbe03cb290, 0x6e2df10caef301be, 0x3be0cd1e20fe1dca, 0x19fe02ca2be0fed3,
-    0xbc3be02da5fe1cd2, 0x7be201fbe02cd341, 0x4fe2da51be301cae, 0x3be1cd2ae3ef02be,
-    0x9ef03ca2fe02d1ce, 0xbe3cd25be02fa10e, 0x3ce12dfae301fbe2, 0x9e2cd30afbe10ca2,
-    0xfbe02da1fe301ce2, 0xbc3e120da5fe01cd, 0x4fe1cd20be3cf10a, 0x3be01ca2fbe02cd3,
-    0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53, 0x9e246cf7be7ff10a, 0x09da563d76eef5ee,
-    0x401df4e43e5c949c, 0xb1b0f55fb9ef775a, 0x7d02b3dfbb910609, 0x8a9bf3df1c808f90,
-    0x616cd4fc28b7eec9, 0xa19a9b1c7dc41c2d, 0x3d39ec5d36e2f171, 0x5b3f1c1f54cfadba,
-    0xbef5e1dc7f30df00, 0x981eeefbe1a700da, 0xc19bb3ea1901cbcc, 0xbc3cbafca7aef00d,
-    0xef2688e100dc8dfa, 0x76251b5c46440b84, 0x6e8f4cb7cb95a315, 0xf8da8d7cb27a206a,
-    0x2289c8a95610ec50, 0x93306c59d95be093, 0xcd6bbd1d575dfa8e, 0x2b8004fcf189da59,
-    0xb8be3f3da33cf852, 0xe00d0bc5d9f0ab56, 0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53,
-    0xd00aa8fd5be9fca8, 0x1da5bb3dfc9fe0dd, 0xaa2dceef5ea2d8fb, 0xb3c0eeefda2beea7,
-    0x5df3cecf5a2ce01d, 0x2d1ebcf3ef2ce10d, 0x7a2cefdc3be1ae7d, 0x93ce3fa9dcbe76a1,
-    0x1fbe32dfcf20ef22, 0x4e6be31da9fbb3ae, 0xbc3defda9cb32ea9, 0x96ef2cda9fb0eb3d,
-    0xfa3be20ca0be0fa2, 0x3be1cd9fa2be0eb1, 0x19aef3bd7a0fbe2d, 0x6cf2de30afbe0cd1,
-    0x8fb3deac70fbe0d3, 0xf02be310adfe20fa, 0x3be02da5be1c6ba1, 0xcbe310dfa30fe2de,
-    0x2be310ca7fe12fbe, 0x4be1cd2ae30fed1c, 0x9ef310da7fe023be, 0x1be0ce2de0fbe210,
-    0x40df21fbe03cb290, 0x6e2df10caef301be, 0x3be0cd1e20fe1dca, 0x19fe02ca2be0fed3,
-    0xbc3be02da5fe1cd2, 0x7be201fbe02cd341, 0x4fe2da51be301cae, 0x3be1cd2ae3ef02be,
-    0x9ef03ca2fe02d1ce, 0xbe3cd25be02fa10e, 0x3ce12dfae301fbe2, 0x9e2cd30afbe10ca2,
-    0xfbe02da1fe301ce2, 0xbc3e120da5fe01cd, 0x4fe1cd20be3cf10a, 0x3be01ca2fbe02cd3,
-    0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53, 0x9e246cf7be7ff10a, 0x09da563d76eef5ee,
-    0x401df4e43e5c949c, 0xb1b0f55fb9ef775a, 0x7d02b3dfbb910609, 0x8a9bf3df1c808f90,
-    0x616cd4fc28b7eec9, 0xa19a9b1c7dc41c2d, 0x3d39ec5d36e2f171, 0x5b3f1c1f54cfadba,
-    0xbef5e1dc7f30df00, 0x981eeefbe1a700da, 0xc19bb3ea1901cbcc, 0xbc3cbafca7aef00d,
-    0xef2688e100dc8dfa, 0x76251b5c46440b84, 0x6e8f4cb7cb95a315, 0xf8da8d7cb27a206a,
-    0x2289c8a95610ec50, 0x93306c59d95be093, 0xcd6bbd1d575dfa8e, 0x2b8004fcf189da59,
-    0xb8be3f3da33cf852, 0xe00d0bc5d9f0ab56, 0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53,
-    0x2be310ca7fe12fbe, 0x4be1cd2ae30fed1c, 0x9ef310da7fe023be, 0x1be0ce2de0fbe210,
-    0xfce30f2ae10fbe3d, 0x9fe302be10adfe2c, 0x40df21fbe03cb290, 0x6e2df10caef301be,
-    0x3be0cd1e20fe1dca, 0x19fe02ca2be0fed3, 0xbc3be02da5fe1cd2, 0x7be201fbe02cd341,
-    0x4fe2da51be301cae, 0x3be1cd2ae3ef02be, 0x9ef03ca2fe02d1ce, 0xbe3cd25be02fa10e,
-    0x3ce12dfae301fbe2, 0x9e2cd30afbe10ca2, 0xfbe02da1fe301ce2, 0xbc3e120da5fe01cd,
-    0x4fe1cd20be3cf10a, 0x3be01ca2fbe02cd3, 0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53,
-    0x9e246cf7be7ff10a, 0x09da563d76eef5ee, 0x401df4e43e5c949c, 0xb1b0f55fb9ef775a,
-    0x7d02b3dfbb910609, 0x8a9bf3df1c808f90, 0x616cd4fc28b7eec9, 0xa19a9b1c7dc41c2d,
-    0x3d39ec5d36e2f171, 0x5b3f1c1f54cfadba, 0xbef5e1dc7f30df00, 0x981eeefbe1a700da,
-    0xc19bb3ea1901cbcc, 0xbc3cbafca7aef00d, 0xef2688e100dc8dfa, 0x76251b5c46440b84,
-    0x6e8f4cb7cb95a315, 0xf8da8d7cb27a206a, 0x2289c8a95610ec50, 0x93306c59d95be093,
-    0xcd6bbd1d575dfa8e, 0x2b8004fcf189da59, 0xb8be3f3da33cf852, 0xe00d0bc5d9f0ab56,
-    0x61a7dc2eb76aa8a8, 0x3ca2fa6b21bc0b53, 0xd00aa8fd5be9fca8, 0x1da5bb3dfc9fe0dd,
-    0xaa2dceef5ea2d8fb, 0xb3c0eeefda2beea7, 0x5df3cecf5a2ce01d, 0x2d1ebcf3ef2ce10d,
-    0x7a2cefdc3be1ae7d, 0x93ce3fa9dcbe76a1, 0x1fbe32dfcf20ef22, 0x4e6be31da9fbb3ae,
-    0xbc3defda9cb32ea9, 0x96ef2cda9fb0eb3d, 0xfa3be20ca0be0fa2, 0x3be1cd9fa2be0eb1,
-    // ADDED 16 MISSING VALUES: Náhradní náhodné entropické 64-bitové vzorce pro kompletní pole
-    0x2c1aefbc70be31ad, 0xfbe302de10ca4fef, 0x40df21bc0eb3da9e, 0x6e2df10caef301be,
-    0x3be0cd1e20fe1dca, 0x19fe02ca2be0fed3, 0xbc3be02da5fe1cd2, 0x7be201fbe02cd341,
-    0x4fe2da51be301cae, 0x3be1cd2ae3ef02be, 0x9ef03ca2fe02d1ce, 0xbe3cd25be02fa10e,
-    0x3ce12dfae301fbe2, 0x9e2cd30afbe10ca2, 0xfbe02da1fe301ce2, 0xbc3e120da5fe01cd,
-];
+// Compile-time SplitMix64 generator using a "nothing-up-my-sleeve" golden ratio seed.
+// Guarantees 256 unique, unbiased, high-entropy 64-bit integers.
+const fn generate_gear_matrix() -> [u64; 256] {
+    let mut matrix = [0u64; 256];
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut i = 0;
+    while i < 256 {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        matrix[i] = z;
+        i += 1;
+    }
+    matrix
+}
 
-fn calculate_shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() { return 0.0; }
-    let mut counts = [0usize; 256];
-    for &b in data { counts[b as usize] += 1; }
-    let len = data.len() as f64;
-    let mut entropy = 0.0;
-    for &count in &counts {
-        if count > 0 {
-            let p = count as f64 / len;
-            entropy -= p * p.log2();
+const GEAR_MATRIX: [u64; 256] = generate_gear_matrix();
+
+/// Incremental per-chunk state to support constant-memory streaming.
+struct ChunkState {
+    fnv_hash: u32,
+    counts: [u64; 256],
+    len: u64,
+}
+
+impl ChunkState {
+    fn new() -> Self {
+        Self {
+            fnv_hash: 2_166_136_261u32,
+            counts: [0u64; 256],
+            len: 0,
         }
     }
-    entropy
-}
 
-fn fnv1a_32(data: &[u8]) -> u32 {
-    let mut hash = 2166136261u32;
-    for &b in data {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(16777619);
+    #[inline]
+    fn update(&mut self, byte: u8) {
+        self.fnv_hash ^= byte as u32;
+        self.fnv_hash = self.fnv_hash.wrapping_mul(16_777_619);
+        self.counts[byte as usize] += 1;
+        self.len += 1;
     }
-    hash
+
+    fn reset(&mut self) {
+        self.fnv_hash = 2_166_136_261u32;
+        self.counts = [0u64; 256];
+        self.len = 0;
+    }
+
+    /// Mixes all 32 bits via a MurmurHash3-style avalanche finalizer before
+    /// XOR-folding into a 6-bit Base64 character index.
+    fn finalize_base64_char(&self) -> char {
+        let mut h = self.fnv_hash;
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x85eb_ca6b);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0xc2b2_ae35);
+        h ^= h >> 16;
+
+        let folded = (h ^ (h >> 6) ^ (h >> 12) ^ (h >> 18) ^ (h >> 24)) & 0x3F;
+        BASE64_CHARS[folded as usize] as char
+    }
+
+    /// Computes Shannon entropy directly from the byte frequency table.
+    fn finalize_entropy_char(&self) -> char {
+        if self.len == 0 {
+            return '0';
+        }
+        let total = self.len as f64;
+        let mut entropy = 0.0;
+        for &count in &self.counts {
+            if count > 0 {
+                let p = count as f64 / total;
+                entropy -= p * p.log2();
+            }
+        }
+        let scaled = (entropy * 1.875).round() as u32;
+        let clamped = scaled.min(15);
+        std::char::from_digit(clamped, 16).unwrap_or('0')
+    }
 }
 
-fn entropy_to_anchor_char(entropy: f64) -> char {
-    let scaled = (entropy * 1.875).round() as u32;
-    let clamped = scaled.min(15);
-    std::char::from_digit(clamped, 16).unwrap_or('0')
-}
-
-// MODERNIZED: High-throughput Content-Defined Chunking via Gear Hash Engine
 pub fn get_ctps_fuzzy_hash<P: AsRef<Path>>(file_path: P) -> io::Result<String> {
-    let mut file = File::open(file_path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let file = File::open(file_path)?;
+    let file_size = file.metadata()?.len();
 
-    if data.is_empty() {
-        return Ok("4:A:A:0".to_string());
+    if file_size == 0 {
+        return Ok("4:A:A:0:0".to_string());
     }
 
-    let file_size = data.len();
-    let mut b = 4;
-    while b * 64 < file_size && b < 4194304 {
+    let mut b: u64 = 4;
+    while b * (MAX_SIGNATURE_LEN as u64) < file_size && b < 4_194_304 {
         b *= 2;
     }
+    let b2 = b * 2;
 
-    let mut sig_b = String::new();
-    let mut sig_2b = String::new();
-    let mut entropy_anchors = String::new();
+    // Inspect the most significant bits of the 64-bit Gear rolling hash
+    let shift_b = 64 - b.trailing_zeros();
+    let mask_b = b - 1;
+    let shift_2b = 64 - b2.trailing_zeros();
+    let mask_2b = b2 - 1;
 
-    let mut chunk_start_b = 0;
-    let mut chunk_start_2b = 0;
+    let mut sig_b = String::with_capacity(MAX_SIGNATURE_LEN);
+    let mut sig_2b = String::with_capacity(MAX_SIGNATURE_LEN);
+    let mut ent_b = String::with_capacity(MAX_SIGNATURE_LEN);
+    let mut ent_2b = String::with_capacity(MAX_SIGNATURE_LEN);
 
-    // Gear Hash rolling state register
+    let mut state_b = ChunkState::new();
+    let mut state_2b = ChunkState::new();
     let mut rolling_hash = 0u64;
 
-    for i in 0..data.len() {
-        let byte_val = data[i] as usize;
+    let mut reader = BufReader::with_capacity(STREAM_BUF_SIZE, file);
+    let mut buf = [0u8; STREAM_BUF_SIZE];
 
-        // Gear rolling formula: Left shift and inject matrix mapping values
-        rolling_hash = (rolling_hash << 1).wrapping_add(GEAR_MATRIX[byte_val]);
-
-        // Evaluation Scale B
-        if rolling_hash % (b as u64) == (b as u64) - 1 {
-            let chunk_len = i + 1 - chunk_start_b;
-            if chunk_len >= b / 2 && sig_b.len() < 64 {
-                let chunk_data = &data[chunk_start_b..=i];
-                let f_hash = fnv1a_32(chunk_data);
-                sig_b.push(BASE64_CHARS[(f_hash % 64) as usize] as char);
-                let ent = calculate_shannon_entropy(chunk_data);
-                entropy_anchors.push(entropy_to_anchor_char(ent));
-                chunk_start_b = i + 1;
-            }
+    loop {
+        let bytes_read = reader.read(&mut buf)?;
+        if bytes_read == 0 {
+            break;
         }
 
-        // Evaluation Scale 2B
-        let b2 = b * 2;
-        if rolling_hash % (b2 as u64) == (b2 as u64) - 1 {
-            let chunk_len = i + 1 - chunk_start_2b;
-            if chunk_len >= b2 / 2 && sig_2b.len() < 64 {
-                let chunk_data = &data[chunk_start_2b..=i];
-                let f_hash = fnv1a_32(chunk_data);
-                sig_2b.push(BASE64_CHARS[(f_hash % 64) as usize] as char);
-                chunk_start_2b = i + 1;
+        for &byte in &buf[..bytes_read] {
+            rolling_hash = (rolling_hash << 1).wrapping_add(GEAR_MATRIX[byte as usize]);
+            state_b.update(byte);
+            state_2b.update(byte);
+
+            // Reserve the 64th slot (index 63) for the final tail flush so no suffix is dropped
+            if (rolling_hash >> shift_b) == mask_b
+                && state_b.len >= b / 2
+                && sig_b.len() < MAX_SIGNATURE_LEN - 1
+            {
+                sig_b.push(state_b.finalize_base64_char());
+                ent_b.push(state_b.finalize_entropy_char());
+                state_b.reset();
+            }
+
+            if (rolling_hash >> shift_2b) == mask_2b
+                && state_2b.len >= b2 / 2
+                && sig_2b.len() < MAX_SIGNATURE_LEN - 1
+            {
+                sig_2b.push(state_2b.finalize_base64_char());
+                ent_2b.push(state_2b.finalize_entropy_char());
+                state_2b.reset();
             }
         }
     }
 
-    // Flush final tail residuals
-    if chunk_start_b < data.len() && sig_b.len() < 64 {
-        let chunk_data = &data[chunk_start_b..];
-        let f_hash = fnv1a_32(chunk_data);
-        sig_b.push(BASE64_CHARS[(f_hash % 64) as usize] as char);
-        let ent = calculate_shannon_entropy(chunk_data);
-        entropy_anchors.push(entropy_to_anchor_char(ent));
+    // Flush remaining tail bytes into the final slot
+    if state_b.len > 0 && sig_b.len() < MAX_SIGNATURE_LEN {
+        sig_b.push(state_b.finalize_base64_char());
+        ent_b.push(state_b.finalize_entropy_char());
     }
-    if chunk_start_2b < data.len() && sig_2b.len() < 64 {
-        let chunk_data = &data[chunk_start_2b..];
-        let f_hash = fnv1a_32(chunk_data);
-        sig_2b.push(BASE64_CHARS[(f_hash % 64) as usize] as char);
+    if state_2b.len > 0 && sig_2b.len() < MAX_SIGNATURE_LEN {
+        sig_2b.push(state_2b.finalize_base64_char());
+        ent_2b.push(state_2b.finalize_entropy_char());
     }
 
-    if sig_b.is_empty() { sig_b.push('A'); entropy_anchors.push('0'); }
-    if sig_2b.is_empty() { sig_2b.push('A'); }
+    if sig_b.is_empty() {
+        sig_b.push('A');
+        ent_b.push('0');
+    }
+    if sig_2b.is_empty() {
+        sig_2b.push('A');
+        ent_2b.push('0');
+    }
 
-    Ok(format!("{}:{}:{}:{}", b, sig_b, sig_2b, entropy_anchors))
+    Ok(format!("{}:{}:{}:{}:{}", b, sig_b, sig_2b, ent_b, ent_2b))
 }
 
+/// Space-optimized O(min(N, M)) Levenshtein distance capped at MAX_SIGNATURE_LEN.
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
-    let v1: Vec<char> = s1.chars().collect();
-    let v2: Vec<char> = s2.chars().collect();
+    let v1: Vec<char> = s1.chars().take(MAX_SIGNATURE_LEN).collect();
+    let v2: Vec<char> = s2.chars().take(MAX_SIGNATURE_LEN).collect();
     let len1 = v1.len();
     let len2 = v2.len();
-    let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
-    for i in 0..=len1 { dp[i][0] = i; }
-    for j in 0..=len2 { dp[0][j] = j; }
+
+    let mut prev: Vec<usize> = (0..=len2).collect();
+    let mut curr = vec![0usize; len2 + 1];
+
     for i in 1..=len1 {
+        curr[0] = i;
         for j in 1..=len2 {
-            if v1[i - 1] == v2[j - 1] { dp[i][j] = dp[i - 1][j - 1]; }
-            else { dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]); }
+            let cost = if v1[i - 1] == v2[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
-    dp[len1][len2]
+    prev[len2]
 }
 
-// FIXED: Symmetrical multi-scale analysis using strict Rust syntax rules
+fn normalized_similarity(s1: &str, s2: &str) -> f64 {
+    let len1 = s1.chars().take(MAX_SIGNATURE_LEN).count();
+    let len2 = s2.chars().take(MAX_SIGNATURE_LEN).count();
+    let max_len = len1.max(len2);
+    if max_len == 0 {
+        return 100.0;
+    }
+    let dist = levenshtein_distance(s1, s2);
+    (1.0 - (dist as f64 / max_len as f64)) * 100.0
+}
+
 pub fn compare_ctps_hashes(h1: &str, h2: &str) -> f64 {
     let p1: Vec<&str> = h1.split(':').collect();
     let p2: Vec<&str> = h2.split(':').collect();
-    if p1.len() < 4 || p2.len() < 4 { return 0.0; }
+    if p1.len() < 4 || p2.len() < 4 {
+        return 0.0;
+    }
 
-    let b1: u32 = p1[0].parse().unwrap_or(0);
-    let b2: u32 = p2[0].parse().unwrap_or(0);
+    let b1: u64 = match p1[0].parse::<u64>() {
+        Ok(val) if val >= 4 && val.is_power_of_two() => val,
+        _ => return 0.0,
+    };
+    let b2: u64 = match p2[0].parse::<u64>() {
+        Ok(val) if val >= 4 && val.is_power_of_two() => val,
+        _ => return 0.0,
+    };
 
-    let (s1, s2) = if b1 == b2 {
-        (p1[1], p2[1])
+    // Align both chunk signatures AND entropy anchors to the exact same block scale
+    let (s1, s2, e1_opt, e2_opt) = if b1 == b2 {
+        (p1[1], p2[1], Some(p1[3]), Some(p2[3]))
     } else if b1 == b2 * 2 {
-        (p1[2], p2[1])
+        // b1 matches 2 * b2: compare h1's scale-b against h2's scale-2b
+        let e2 = p2.get(4).copied();
+        (p1[1], p2[2], Some(p1[3]), e2)
     } else if b2 == b1 * 2 {
-        (p1[1], p2[2])
+        // b2 matches 2 * b1: compare h1's scale-2b against h2's scale-b
+        let e1 = p1.get(4).copied();
+        (p1[2], p2[1], e1, Some(p2[3]))
     } else {
         return 0.0;
     };
-    
-    let max_len = s1.len().max(s2.len());
-    if max_len == 0 { return 100.0; }
-    
-    let dist = levenshtein_distance(s1, s2);
-    let score = (1.0 - (dist as f64 / max_len as f64)) * 100.0;
-    
-    let e1 = p1[3];
-    let e2 = p2[3];
-    let e_max = e1.len().max(e2.len());
-    
-    if e_max > 0 {
-        let e_dist = levenshtein_distance(e1, e2);
-        let e_score = (1.0 - (e_dist as f64 / e_max as f64)) * 100.0;
-        return (score * 0.8) + (e_score * 0.2);
+
+    let sig_score = normalized_similarity(s1, s2);
+
+    if let (Some(e1), Some(e2)) = (e1_opt, e2_opt) {
+        if !e1.is_empty() && !e2.is_empty() {
+            let ent_score = normalized_similarity(e1, e2);
+            return (sig_score * 0.8) + (ent_score * 0.2);
+        }
     }
-    score
+
+    sig_score
 }
 
 fn main() {
@@ -249,28 +265,40 @@ fn main() {
         println!("Comparison:  ith_fuzzy /compare <hash_1> <hash_2>");
         return;
     }
-    
+
     if args[1] == "/compare" || args[1] == "--compare" {
         if args.len() < 4 {
-            eprintln!("{}Error: Two target hashes are required for comparison.{}", COLOR_RED, COLOR_RESET);
+            eprintln!(
+                "{}Error: Two target hashes are required for comparison.{}",
+                COLOR_RED, COLOR_RESET
+            );
             std::process::exit(1);
         }
         let score = compare_ctps_hashes(&args[2], &args[3]);
         if score > 50.0 {
-            println!("{}Similarity Score: {:.2}% [MATCH]{}", COLOR_GREEN, score, COLOR_RESET);
+            println!(
+                "{}Similarity Score: {:.2}% [MATCH]{}",
+                COLOR_GREEN, score, COLOR_RESET
+            );
         } else {
-            println!("{}Similarity Score: {:.2}% [MISMATCH]{}", COLOR_RED, score, COLOR_RESET);
+            println!(
+                "{}Similarity Score: {:.2}% [MISMATCH]{}",
+                COLOR_RED, score, COLOR_RESET
+            );
         }
         return;
     }
-    
+
     let raw_path = args[1..].join(" ");
     let file_path = raw_path.trim_matches('"');
-    
+
     match get_ctps_fuzzy_hash(file_path) {
         Ok(hash) => println!("{}", hash),
         Err(e) => {
-            eprintln!("{}Error reading target file '{}': {}{}", COLOR_RED, file_path, e, COLOR_RESET);
+            eprintln!(
+                "{}Error reading target file '{}': {}{}",
+                COLOR_RED, file_path, e, COLOR_RESET
+            );
             std::process::exit(1);
         }
     }
