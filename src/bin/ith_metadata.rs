@@ -305,7 +305,7 @@ fn parse_elf(data: &[u8]) -> Option<Findings> {
         if name.as_slice() != b".dynamic" { continue; }
         let (off, size) = (secs[i].2, secs[i].3);
         let entsize: u64 = if is64 { 16 } else { 8 };
-        let count = size / entsize;
+        let Some(count) = size.checked_div(entsize) else { continue; };
         for j in 0..count {
             let b_u64 = off.checked_add(j.checked_mul(entsize)?)?;
             let b = usize::try_from(b_u64).ok()?;
@@ -331,7 +331,7 @@ fn parse_elf(data: &[u8]) -> Option<Findings> {
         let strtab = secs.get(sh_link as usize)?;
         let sd = slice(data, strtab.2, strtab.3)?;
         let entsize = if sh_entsize > 0 { sh_entsize } else { if is64 { 24 } else { 16 } };
-        let count = sh_size / entsize;
+        let Some(count) = sh_size.checked_div(entsize) else { continue; };
         let (info_off, shndx_off) = if is64 { (4usize, 6usize) } else { (12, 14) };
 
         for k in 0..count {
@@ -434,8 +434,8 @@ fn parse_pe(data: &[u8]) -> Option<Findings> {
             for _ in 0..MAX_IMPORT_DLLS {
                 if id_off.checked_add(20).map_or(true, |end| end > data.len()) { break; }
                 let ilt  = ru32(data, id_off).unwrap_or(0);
-                let name = ru32(data, id_off + 12).unwrap_or(0);
-                let iat  = ru32(data, id_off + 16).unwrap_or(0);
+                let name = id_off.checked_add(12).and_then(|o| ru32(data, o)).unwrap_or(0);
+                let iat  = id_off.checked_add(16).and_then(|o| ru32(data, o)).unwrap_or(0);
                 if ilt == 0 && name == 0 && iat == 0 { break; }
 
                 // Canonicalize DLL name to ASCII lowercase (Windows loader is case-insensitive)

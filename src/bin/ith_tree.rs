@@ -286,12 +286,13 @@ pub fn compute_merkle_tree_root<P: AsRef<Path>>(
         let handle = thread::spawn(move || {
             let mut local_buf = vec![0u8; CHUNK_SIZE_1MB];
             let bytes_read = {
-                let mut f = file_clone.lock().unwrap();
-                let _ = f.seek(SeekFrom::Start((chunk_idx * CHUNK_SIZE_1MB) as u64));
+                let mut f = file_clone.lock().expect("mutex poisoned");
+                let offset = (chunk_idx as u64) * (CHUNK_SIZE_1MB as u64);
+                let _ = f.seek(SeekFrom::Start(offset));
                 f.read(&mut local_buf).unwrap_or(0)
             };
             let chunk_hash = hash_leaf_chunk(&local_buf[..bytes_read], config);
-            let mut l = leaves_clone.lock().unwrap();
+            let mut l = leaves_clone.lock().expect("mutex poisoned");
             l[chunk_idx] = chunk_hash;
         });
         workers.push(handle);
@@ -302,7 +303,10 @@ pub fn compute_merkle_tree_root<P: AsRef<Path>>(
     }
 
     // PHASE 2: Symmetrical Pairwise Reduction Tree Collapse
-    let mut current_level = Arc::try_unwrap(leaves).unwrap().into_inner().unwrap();
+    let mut current_level = Arc::try_unwrap(leaves)
+        .expect("worker threads still hold Arc reference")
+        .into_inner()
+        .expect("mutex poisoned");
 
     while current_level.len() > 1 {
         let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);

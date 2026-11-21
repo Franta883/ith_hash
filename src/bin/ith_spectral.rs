@@ -329,9 +329,9 @@ impl HardenedLatticeSponge {
 
         let mut chunks_iter = data.chunks_exact(64);
         for block in &mut chunks_iter {
-            for i in 0..8 {
-                let word = u64::from_le_bytes(block[i * 8..(i + 1) * 8].try_into().unwrap());
-                self.state[i] ^= word;
+            let (words, _) = block.as_chunks::<8>();
+            for (i, &word_bytes) in words.iter().enumerate() {
+                self.state[i] ^= u64::from_le_bytes(word_bytes);
             }
             self.permute();
         }
@@ -343,9 +343,9 @@ impl HardenedLatticeSponge {
         pad_block[rem.len()] ^= 0x80;
         pad_block[63] ^= 0x01;
 
-        for i in 0..8 {
-            let word = u64::from_le_bytes(pad_block[i * 8..(i + 1) * 8].try_into().unwrap());
-            self.state[i] ^= word;
+        let (pad_words, _) = pad_block.as_chunks::<8>();
+        for (i, &word_bytes) in pad_words.iter().enumerate() {
+            self.state[i] ^= u64::from_le_bytes(word_bytes);
         }
         self.permute();
     }
