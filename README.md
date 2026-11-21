@@ -1,29 +1,29 @@
-# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v3.2.0)
+# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v3.2.1)
 
 **ITH-Hash Suite** is a unified, zero-dependency mathematical framework written in Rust. Moving away from legacy architectures, it provides a hardened toolkit for post-quantum signatures, extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
 
 ---
 
-## 🆕 What's New in v3.2.0
+## 🆕 What's New in v3.2.0/v3.2.1
 
 * **Full 2D Keccak-f Geometry (`ith_hash` & `ith_tree`):** Upgraded the permutation engine from 1D index shuffling to true 2D coordinate dispersion $(x, y) \mapsto (y, (2x + 3y) \bmod 5)$ paired with row-wise quadratic $\chi$ mapping and asymmetric LFSR round constants ($\iota$).
 * **Hardened Directory & Merkle Tree Engine (`ith_hash`):** Added `/folder` and `/usemerkletree` modes with length-prefixed canonical records, full 512-bit internal Merkle node widths, and explicit tracking of empty directories and symlinks.
 * **5-Part Dual-Scale Fuzzy Format (`ith_fuzzy`):** Replaced the 4-part signature with `B:Sig_B:Ent_B:Sig_2B:Ent_2B`, aligning Shannon entropy anchors to both $B$ and $2B$ block granularities.
 * **Constant-Time Verification Oracle (`/check`):** Enforced strict hexadecimal validation, a 32-character (128-bit) minimum length floor, order-independent CLI argument parsing, and constant-time comparison across the suite.
-* **Streaming & Memory Hardening:** Eliminated full-file RAM buffering in favor of fixed-size `BufReader` streaming across large datasets.
+* **Static Analysis & DoS Hardening:** Verified with **Clippy** and **Semgrep** (zero true-positive findings, zero `unsafe` blocks, zero `.unwrap()` panics on untrusted inputs).
 
 ---
 
 ## 🛡️ Security Audit & Vulnerabilities Fixed
 
-Every module in the suite underwent a comprehensive cryptographic and systems audit to eliminate theoretical and runtime flaws:
+Every module in the suite underwent a comprehensive cryptographic and static-analysis audit to eliminate theoretical and runtime flaws:
 
 ### 1. Core XOF & Tree Engines (`ith_hash` & `ith_tree`)
 * **2D Inter-Column Dispersion & Symmetry Removal:** Replaced the 1D `(i * 7) % 25` shuffle and column-symmetric round constants (which partially canceled out in the $\theta$ parity layer) with full 2D Keccak-f $\pi$, $\chi$, and single-lane $\iota$ round constants.
 * **Single-Block `pad10*1` Alignment:** Fixed edge-case multi-block padding behavior when remaining bytes equaled `block_size - 1`, collapsing padding cleanly into `0x81`.
 * **Merkle Tree Internal Width & Second-Preimage Defense:** Prevented weak internal tree collisions when short XOF output lengths are requested by locking all internal Merkle nodes to 512 bits (128 hex characters) and enforcing strict domain prefixes (`LEAF:`, `NODE:`, `NODE_ODD:`).
 * **Delimiter Injection & Symlink Loop Prevention:** Added explicit byte-length prefixes to directory records (`DIR:len:path`, `FILE:len:path:size:hash`, `SYMLINK:len:path:target_len:target`) and switched to `entry.file_type()` so symlinks are hashed as metadata rather than followed infinitely.
-* **Interrupted `read()` Handling:** Added `read_full` loops to prevent partial disk or OS-interrupted reads from prematurely truncating file streams.
+* **Interrupted `read()` & Offset Overflow Handling:** Added `read_full` loops to prevent partial OS-interrupted reads from truncating file streams, and enforced explicit `u64` offset multiplication (`(chunk_idx as u64) * (CHUNK_SIZE_1MB as u64)`) to prevent 32-bit integer overflows on large files.
 
 ### 2. Forensic Fuzzy Engine (`ith_fuzzy`)
 * **Gear Hash MSB Boundary Trigger:** Fixed a rolling-window collapse where LSB modulo (`rolling_hash % b`) only inspected the lowest $\log_2(b)$ bits and locked out even `GEAR_MATRIX` entries. Shifted to MSB inspection (`(rolling_hash >> (64 - bits)) == 0`) so all 64 bits of the sliding window participate.
@@ -33,8 +33,8 @@ Every module in the suite underwent a comprehensive cryptographic and systems au
 * **DoS & OOM Mitigation:** Replaced `read_to_end` with a 64 KB `BufReader` stream and reduced Levenshtein distance memory from $O(N \times M)$ to a bounded $O(\min(N, M))$ 2-row rolling buffer.
 
 ### 3. Static Metadata & Spectral Engines (`ith_metadata` & `ith_spectral`)
-* **Bounds-Checked Binary Parsing (`ith_metadata`):** Hardened COFF, PE IAT/EAT, and ELF section/symbol table offsets against malformed or truncated headers while keeping standalone RFC 6234 SHA-256 computation free of external dependencies.
-* **Decoupled Noiseless Topology (`ith_spectral`):** Separated volatile LWE Gaussian noise (used strictly for the 64-byte Edwards-curve Rigid Root) from the pre-noise NTT spectral accumulator, stabilizing the 128-byte Gray-coded thermometer Fuzzy Mask against single-bit avalanche distortion.
+* **Division-by-Zero & Checked Offset Guards (`ith_metadata`):** Guarded ELF section/symbol entry table divisions (`size.checked_div(entsize)`) against crafted zero-sized entries, enforced `checked_add` across PE Import Directory offsets, and kept standalone RFC 6234 SHA-256 computation free of external dependencies.
+* **Decoupled Noiseless Topology & Zero-Unwrap Conversion (`ith_spectral`):** Separated volatile LWE Gaussian noise (used strictly for the 64-byte Edwards-curve Rigid Root) from the pre-noise NTT spectral accumulator, stabilizing the 128-byte Gray-coded thermometer Fuzzy Mask against single-bit avalanche distortion while eliminating slice `.unwrap()` calls.
 
 ---
 
