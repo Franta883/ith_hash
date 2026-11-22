@@ -1,40 +1,37 @@
-# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v3.2.1)
+# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.0.0)
 
-**ITH-Hash Suite** is a unified, zero-dependency mathematical framework written in Rust. Moving away from legacy architectures, it provides a hardened toolkit for post-quantum signatures, extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
-
----
-
-## 🆕 What's New in v3.2.0/v3.2.1
-
-* **Full 2D Keccak-f Geometry (`ith_hash` & `ith_tree`):** Upgraded the permutation engine from 1D index shuffling to true 2D coordinate dispersion $(x, y) \mapsto (y, (2x + 3y) \bmod 5)$ paired with row-wise quadratic $\chi$ mapping and asymmetric LFSR round constants ($\iota$).
-* **Hardened Directory & Merkle Tree Engine (`ith_hash`):** Added `/folder` and `/usemerkletree` modes with length-prefixed canonical records, full 512-bit internal Merkle node widths, and explicit tracking of empty directories and symlinks.
-* **5-Part Dual-Scale Fuzzy Format (`ith_fuzzy`):** Replaced the 4-part signature with `B:Sig_B:Ent_B:Sig_2B:Ent_2B`, aligning Shannon entropy anchors to both $B$ and $2B$ block granularities.
-* **Constant-Time Verification Oracle (`/check`):** Enforced strict hexadecimal validation, a 32-character (128-bit) minimum length floor, order-independent CLI argument parsing, and constant-time comparison across the suite.
-* **Static Analysis & DoS Hardening:** Verified with **Clippy** and **Semgrep** (zero true-positive findings, zero `unsafe` blocks, zero `.unwrap()` panics on untrusted inputs).
+**ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust under strict **`#![deny(unsafe_code)]`** enforcement. Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
 
 ---
 
-## 🛡️ Security Audit & Vulnerabilities Fixed
+## 🆕 What's New in v4.0.0
 
-Every module in the suite underwent a comprehensive cryptographic and static-analysis audit to eliminate theoretical and runtime flaws:
+* **3D Bit-Sliced State Geometry (`[[u64; 5]; 5]`):** Upgraded the internal permutation matrix from flat `[u64; 25]` arrays to true 3D bit-sliced state lanes indexed as `state[x][y]` and `KECCAK_RHO[x][y]` using linear coordinate mapping ($x = i \bmod 5, y = \lfloor i / 5 \rfloor$).
+* **Paranoid-by-Default & Cryptographic Domain Separation:** Changed the default profile of `ith_hash` from Standard to **Paranoid** ($c = 1536, r = 64$), making `/standard` ($c = 1024, r = 576$) an explicit opt-in flag. Replaced generic `0x01` padding with profile-specific domain separation suffixes (`0x06` for Paranoid, `0x0A` for Standard) prior to `pad10*1` termination to guarantee cross-profile output independence.
+* **Stateful Sponge Phase Locking (`IthHasher`):** Replaced stateless one-shot arrays with a dedicated `IthHasher` state machine that isolates hidden capacity lanes, enforces phase locking (`finalized: bool`) to reject `absorb()` calls once squeezing begins, and supports sequential multi-call XOF streaming via `squeeze()`.
+* **Volatile Memory Zeroization & Hardened Constant-Time Check:** Enforced `#![deny(unsafe_code)]` across the crate, implemented `volatile_zero_u64_grid` and `volatile_zero_bytes` with `Ordering::SeqCst` compiler fences inside `impl Drop for IthHasher`, and hardened `constant_time_eq` using `core::ptr::read_volatile` to prevent dead-store elimination and branch timing leaks.
 
-### 1. Core XOF & Tree Engines (`ith_hash` & `ith_tree`)
-* **2D Inter-Column Dispersion & Symmetry Removal:** Replaced the 1D `(i * 7) % 25` shuffle and column-symmetric round constants (which partially canceled out in the $\theta$ parity layer) with full 2D Keccak-f $\pi$, $\chi$, and single-lane $\iota$ round constants.
-* **Single-Block `pad10*1` Alignment:** Fixed edge-case multi-block padding behavior when remaining bytes equaled `block_size - 1`, collapsing padding cleanly into `0x81`.
-* **Merkle Tree Internal Width & Second-Preimage Defense:** Prevented weak internal tree collisions when short XOF output lengths are requested by locking all internal Merkle nodes to 512 bits (128 hex characters) and enforcing strict domain prefixes (`LEAF:`, `NODE:`, `NODE_ODD:`).
-* **Delimiter Injection & Symlink Loop Prevention:** Added explicit byte-length prefixes to directory records (`DIR:len:path`, `FILE:len:path:size:hash`, `SYMLINK:len:path:target_len:target`) and switched to `entry.file_type()` so symlinks are hashed as metadata rather than followed infinitely.
-* **Interrupted `read()` & Offset Overflow Handling:** Added `read_full` loops to prevent partial OS-interrupted reads from truncating file streams, and enforced explicit `u64` offset multiplication (`(chunk_idx as u64) * (CHUNK_SIZE_1MB as u64)`) to prevent 32-bit integer overflows on large files.
+---
+
+## 🛡️ Security & Hardening Architecture
+
+### 1. Core Stateful XOF & Tree Engines (`ith_hash` & `ith_tree`)
+* **3D Keccak-f Dispersion & Asymmetric Constants:** Full 3D coordinate dispersion $(x, y) \mapsto (y, (2x + 3y) \bmod 5)$ paired with row-wise quadratic $\chi$ mapping (algebraic degree 2) and single-lane asymmetric LFSR round constants ($\iota$) injected into `state[0][0]`.
+* **Domain-Separated `pad10*1` Alignment:** Eliminates collision ambiguity between Standard (`0x0A`) and Paranoid (`0x06`) profiles while cleanly handling single-block boundary alignments.
+* **Merkle Tree Internal Width & Second-Preimage Defense:** Locks all internal Merkle nodes to 512 bits (128 hex characters) regardless of requested output length and enforces strict domain prefixes (`LEAF:`, `NODE:`, `NODE_ODD:`).
+* **Delimiter Injection & Symlink Loop Prevention:** Prefixes directory records with explicit byte lengths (`DIR:len:path`, `FILE:len:path:size:hash`, `SYMLINK:len:path:target_len:target`) and inspects `entry.file_type()` directly so symlinks are hashed as metadata rather than traversed infinitely.
+* **Interrupted I/O & Overflow Protection:** Uses `read_full` loops against OS-interrupted reads and enforces explicit `u64` offset arithmetic (`(chunk_idx as u64) * (CHUNK_SIZE_1MB as u64)`) to prevent 32-bit integer overflows.
 
 ### 2. Forensic Fuzzy Engine (`ith_fuzzy`)
-* **Gear Hash MSB Boundary Trigger:** Fixed a rolling-window collapse where LSB modulo (`rolling_hash % b`) only inspected the lowest $\log_2(b)$ bits and locked out even `GEAR_MATRIX` entries. Shifted to MSB inspection (`(rolling_hash >> (64 - bits)) == 0`) so all 64 bits of the sliding window participate.
-* **Compile-Time SplitMix64 `GEAR_MATRIX`:** Replaced biased and duplicated table constants with 256 deterministic, high-entropy 64-bit values generated at compile time via SplitMix64.
-* **FNV-1a Upper-Bit Folding:** Fixed a mathematical blind spot where `% 64` ignored the upper 2 bits (`0xC0`) of every input byte by XOR-folding all 32 bits of the FNV-1a state into the 6-bit Base64 index.
-* **Suffix Tail-Folding & Scale-Aligned Entropy:** Prevented blind truncation after 64 chunks by folding remaining file data into the 64th signature character, and paired separate entropy anchors to both $B$ and $2B$ scales.
-* **DoS & OOM Mitigation:** Replaced `read_to_end` with a 64 KB `BufReader` stream and reduced Levenshtein distance memory from $O(N \times M)$ to a bounded $O(\min(N, M))$ 2-row rolling buffer.
+* **Gear Hash MSB Boundary Trigger:** Uses MSB inspection (`(rolling_hash >> (64 - bits)) == 0`) so all 64 bits of the sliding window participate in chunk boundary detection.
+* **Compile-Time SplitMix64 `GEAR_MATRIX`:** Generates 256 deterministic, high-entropy 64-bit constants at compile time via SplitMix64.
+* **FNV-1a Full-Width XOR Folding:** Folds all 32 bits of the FNV-1a chunk digest into the 6-bit Base64 index so upper byte bits (`0xC0`) contribute equally.
+* **5-Part Scale-Aligned Signature (`B:Sig_B:Ent_B:Sig_2B:Ent_2B`):** Folds trailing stream data past 64 chunks into the 64th signature character and pairs separate Shannon entropy anchors to both $B$ and $2B$ scales.
+* **Bounded Memory Execution:** Streams files through a 64 KB `BufReader` and computes Levenshtein edit distance using a bounded $O(\min(N, M))$ 2-row rolling array.
 
 ### 3. Static Metadata & Spectral Engines (`ith_metadata` & `ith_spectral`)
-* **Division-by-Zero & Checked Offset Guards (`ith_metadata`):** Guarded ELF section/symbol entry table divisions (`size.checked_div(entsize)`) against crafted zero-sized entries, enforced `checked_add` across PE Import Directory offsets, and kept standalone RFC 6234 SHA-256 computation free of external dependencies.
-* **Decoupled Noiseless Topology & Zero-Unwrap Conversion (`ith_spectral`):** Separated volatile LWE Gaussian noise (used strictly for the 64-byte Edwards-curve Rigid Root) from the pre-noise NTT spectral accumulator, stabilizing the 128-byte Gray-coded thermometer Fuzzy Mask against single-bit avalanche distortion while eliminating slice `.unwrap()` calls.
+* **Division-by-Zero & Checked Offset Guards (`ith_metadata`):** Guards ELF section/symbol entry table divisions (`size.checked_div(entsize)`) against malformed zero-sized entries, enforces `checked_add` across PE Import Directory offsets, and runs a standalone RFC 6234 SHA-256 engine.
+* **Decoupled Noiseless Topology (`ith_spectral`):** Separates volatile LWE Gaussian noise (used strictly for the 64-byte Edwards-curve Rigid Root) from the pre-noise NTT spectral accumulator, stabilizing the 128-byte Gray-coded thermometer Fuzzy Mask against single-bit avalanche distortion.
 
 ---
 
@@ -42,7 +39,7 @@ Every module in the suite underwent a comprehensive cryptographic and static-ana
 
 | Binary Target | Engine Variant | Core Purpose | Architectural Mechanism |
 | :--- | :--- | :--- | :--- |
-| `ith_hash` | **Unified Cryptographic XOF** | High-throughput file & directory signing with variable Extendable-Output Squeezing. | 24-round 2D Keccak-f permutation supporting Standard ($c=1024$) and Paranoid ($c=1536$) modes, plus `/folder` and `/usemerkletree`. |
+| `ith_hash` | **Stateful Cryptographic XOF** | High-security file & directory signing with memory zeroization and Extendable-Output Squeezing. | 24-round 3D bit-sliced `IthHasher` defaulting to **Paranoid** ($c=1536$, suffix `0x06`) with opt-in `/standard` ($c=1024$, suffix `0x0A`), `/folder`, and `/usemerkletree`. |
 | `ith_tree` | **Parallel Merkle Tree Engine** | Multi-threaded tree hashing for massive files with dynamic post-quantum capacity scaling. | Concurrent 1 MB leaf chunk hashing across native OS threads with domain separation (`0x00`/`0x01`) and `/boostc` ($c=1536$). |
 | `ith_fuzzy` | **CTPS Forensic Hashing** | Content-defined similarity matching to detect modified, padded, or rearranged binaries. | Streaming 64-bit SplitMix64 Gear Hash, XOR-folded FNV-1a compression, and dual-scale Shannon entropy anchors. |
 | `ith_metadata` | **Structural Features Analyzer** | Generates order-independent invariant structural hashes and detects compiler language (PE & ELF). | Zero-dependency byte-level IAT/EAT/section extraction paired with a standalone RFC 6234 SHA-256 implementation. |
@@ -68,11 +65,11 @@ Optimized binaries will be generated at:
 ### Execution Snippets
 
 ```bash
-# 1. Unified XOF File & Directory Hashing (ith_hash)
-target/release/ith_hash.exe /standard "path/to/file.dat"
-target/release/ith_hash.exe /paranoid "path/to/file.dat" 500
+# 1. Stateful XOF File & Directory Hashing (ith_hash - defaults to Paranoid c=1536)
+target/release/ith_hash.exe "path/to/file.dat"
+target/release/ith_hash.exe /standard "path/to/file.dat" 500
 target/release/ith_hash.exe /folder /usemerkletree "path/to/directory" 128
-target/release/ith_hash.exe /standard "path/to/file.dat" /check <expected_hash>
+target/release/ith_hash.exe "path/to/file.dat" /check <expected_hash>
 
 # 2. Multi-Threaded File Merkle Tree (ith_tree)
 target/release/ith_tree.exe "path/to/massive_file.iso"
