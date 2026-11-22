@@ -49,7 +49,7 @@
 
 ## 🚀 Native Compilation & Quickstart
 
-To preserve source verification and ensure absolute repository trust, this suite does not distribute pre-compiled binaries. Compile all five standalone executables simultaneously from source code using Cargo:
+Compile all five standalone executables simultaneously from source code using Cargo:
 
 ```bash
 cargo build --release
