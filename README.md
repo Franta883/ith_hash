@@ -1,6 +1,6 @@
 # ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.1.0)
 
-**ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust under strict **`#![deny(unsafe_code)]`** enforcement. Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
+**ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust. Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
 
 ---
 
