@@ -1,15 +1,15 @@
-# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.1.0)
+# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.2.0)
 
-**ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust. Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
+**ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust with **strictly scoped `unsafe` boundaries** (reserved exclusively for OS-level descriptor pinning and volatile memory scrubbing). Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
 
 ---
 
-## 🆕 What's New in v4.1.0
+## 🆕 What's New in v4.2.0
 
-* **Directory Collision & Domain Separation Hardening (`ith_hash`):** Replaced lossy UTF-8 path string formatting with raw OS-encoded path byte framing (`as_encoded_bytes()`), removed cross-platform backslash normalization to prevent Unix path separator collisions (`a/b` vs. `a\b`), enforced `ROOT_FINAL:` domain separation on single-entry directory Merkle trees across all output lengths, and tagged unreadable symlink errors and special files (`FIFO`, sockets, device nodes) distinctly.
-* **`/check` Verification & DoS Guards:** Enforced minimum digest length validation in `/check` mode to prevent length-downgrade truncation attacks, capped maximum XOF squeeze allocations to block OOM crashes on oversized length inputs, and bounded directory traversal depth with an iterative work stack.
-* **Custom Zeroizing Read Buffer & Complete Stack/Heap Wipe:** Added a 64 KB stack-allocated zeroizing read buffer (preserving the exact $r = 64$ bit Paranoid absorption rate while eliminating per-chunk syscall storms), guaranteed buffer zeroization on early I/O errors, wiped temporary permutation arrays (`b`, `c`, `word_bytes`) in `permute_state`, replaced per-byte `format!` allocations in `squeeze_hex` with a zeroized lookup-table pipeline, and hardened `constant_time_eq` with `core::hint::black_box`.
-* **CLI Argument & Stream Accuracy Fixes:** Switched CLI parsing to raw `env::args_os()` without quote/whitespace stripping, prioritized existing filesystem paths over numeric `output_length` parsing, eliminated `/check` path-vs-hash argument swaps, and recorded hashed byte counts directly from the verified read stream.
+* **Cross-Type & Merkle Structural Collision Elimination (`ith_hash`):** Prepended mandatory 1-byte sponge domain prefixes (`0x00` raw file streams, `0x01` Merkle leaves, `0x02` Merkle internal nodes, `0x03` directory manifests/roots) so single-file payloads can never collide with directory or Merkle structures, enforced `LEAF:` pre-hashing prior to pairwise tree reduction, and committed leaf counts into `ROOT_FINAL:<leaf_count>:<root>`.
+* **OS-Level TOCTOU Pinning & Richer Filesystem Metadata:** Replaced path-based traversal with descriptor-pinned `openat` (`O_DIRECTORY | O_NOFOLLOW`) and `fstatat` (`AT_SYMLINK_NOFOLLOW`) checks on Unix (and reparse-point handle verification on Windows), propagated `read_link` errors directly instead of hashing synthetic error strings, and included file permission modes (`mode`) and device IDs (`rdev`) in directory records.
+* **`/check` Downgrade Defense & Terminal Escape Sanitization:** Locked `/check` verification to a canonical 128-character (512-bit) default unless `/len:<N>` is explicitly passed to block prefix-truncation downgrades, and sanitized all printed paths against C0/C1 ANSI escape sequences (`0x00..=0x1F`, `0x7F..=0x9F`).
+* **Branchless Constant-Time Hex, Full-Capacity Zeroization & API Hardening:** Replaced lookup-table hex formatting with branchless constant-time nibble arithmetic, added `write_volatile` + `SeqCst` full-capacity heap scrubbing (`ZeroizingString`/`ZeroizingVec`) alongside stack lane zeroization, parameterized `get_internal_tools_xof` directly by `Profile`, enforced strict `Result` parsing in `Profile::from_str`, and validated even-length digest bounds.
 
 ---
 
@@ -18,8 +18,8 @@
 ### 1. Core Stateful XOF & Tree Engines (`ith_hash` & `ith_tree`)
 * **3D Keccak-f Dispersion & Asymmetric Constants:** Full 3D coordinate dispersion $(x, y) \mapsto (y, (2x + 3y) \bmod 5)$ paired with row-wise quadratic $\chi$ mapping (algebraic degree 2) and single-lane asymmetric LFSR round constants ($\iota$) injected into `state[0][0]`.
 * **Domain-Separated `pad10*1` Alignment:** Eliminates collision ambiguity between Standard (`0x0A`) and Paranoid (`0x06`) profiles while cleanly handling single-block boundary alignments.
-* **Merkle Tree Internal Width & Second-Preimage Defense:** Locks all internal Merkle nodes to 512 bits (128 hex characters) regardless of requested output length and enforces strict domain prefixes (`LEAF:`, `NODE:`, `NODE_ODD:`).
-* **Delimiter Injection & Symlink Loop Prevention:** Prefixes directory records with explicit byte lengths (`DIR:len:path`, `FILE:len:path:size:hash`, `SYMLINK:len:path:target_len:target`) and inspects `entry.file_type()` directly so symlinks are hashed as metadata rather than traversed infinitely.
+* **Merkle Tree Internal Width & Second-Preimage Defense:** Locks all internal Merkle nodes to 512 bits (128 hex characters) regardless of requested output length and enforces strict domain prefixes (`LEAF:`, `NODE:`, `NODE_ODD:`, `ROOT_FINAL:`).
+* **Delimiter Injection & Symlink Loop Prevention:** Prefixes directory records with explicit byte lengths (`DIR:len:path`, `FILE:len:path:size:hash`, `SYMLINK:len:path:target_len:target`) and pins directory descriptors via `openat`/`fstatat` so symlinks are hashed as metadata rather than traversed infinitely.
 * **Interrupted I/O & Overflow Protection:** Uses `read_full` loops against OS-interrupted reads and enforces explicit `u64` offset arithmetic (`(chunk_idx as u64) * (CHUNK_SIZE_1MB as u64)`) to prevent 32-bit integer overflows.
 
 ### 2. Forensic Fuzzy Engine (`ith_fuzzy`)
