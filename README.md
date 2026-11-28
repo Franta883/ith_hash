@@ -1,15 +1,15 @@
-# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.0.0)
+# ITH-Hash Suite: Cryptographic, Forensic & Spectral Framework (v4.1.0)
 
 **ITH-Hash Suite** is a unified, zero-dependency cryptographic and forensic framework written in Rust under strict **`#![deny(unsafe_code)]`** enforcement. Moving away from legacy architectures, it provides a memory-hardened toolkit for post-quantum signatures, stateful extendable-output squeezes (XOF), parallel Merkle tree integrity, static PE/ELF binary analysis, and dual-scale forensic similarity mapping.
 
 ---
 
-## 🆕 What's New in v4.0.0
+## 🆕 What's New in v4.1.0
 
-* **3D Bit-Sliced State Geometry (`[[u64; 5]; 5]`):** Upgraded the internal permutation matrix from flat `[u64; 25]` arrays to true 3D bit-sliced state lanes indexed as `state[x][y]` and `KECCAK_RHO[x][y]` using linear coordinate mapping ($x = i \bmod 5, y = \lfloor i / 5 \rfloor$).
-* **Paranoid-by-Default & Cryptographic Domain Separation:** Changed the default profile of `ith_hash` from Standard to **Paranoid** ($c = 1536, r = 64$), making `/standard` ($c = 1024, r = 576$) an explicit opt-in flag. Replaced generic `0x01` padding with profile-specific domain separation suffixes (`0x06` for Paranoid, `0x0A` for Standard) prior to `pad10*1` termination to guarantee cross-profile output independence.
-* **Stateful Sponge Phase Locking (`IthHasher`):** Replaced stateless one-shot arrays with a dedicated `IthHasher` state machine that isolates hidden capacity lanes, enforces phase locking (`finalized: bool`) to reject `absorb()` calls once squeezing begins, and supports sequential multi-call XOF streaming via `squeeze()`.
-* **Volatile Memory Zeroization & Hardened Constant-Time Check:** Enforced `#![deny(unsafe_code)]` across the crate, implemented `volatile_zero_u64_grid` and `volatile_zero_bytes` with `Ordering::SeqCst` compiler fences inside `impl Drop for IthHasher`, and hardened `constant_time_eq` using `core::ptr::read_volatile` to prevent dead-store elimination and branch timing leaks.
+* **Directory Collision & Domain Separation Hardening (`ith_hash`):** Replaced lossy UTF-8 path string formatting with raw OS-encoded path byte framing (`as_encoded_bytes()`), removed cross-platform backslash normalization to prevent Unix path separator collisions (`a/b` vs. `a\b`), enforced `ROOT_FINAL:` domain separation on single-entry directory Merkle trees across all output lengths, and tagged unreadable symlink errors and special files (`FIFO`, sockets, device nodes) distinctly.
+* **`/check` Verification & DoS Guards:** Enforced minimum digest length validation in `/check` mode to prevent length-downgrade truncation attacks, capped maximum XOF squeeze allocations to block OOM crashes on oversized length inputs, and bounded directory traversal depth with an iterative work stack.
+* **Custom Zeroizing Read Buffer & Complete Stack/Heap Wipe:** Added a 64 KB stack-allocated zeroizing read buffer (preserving the exact $r = 64$ bit Paranoid absorption rate while eliminating per-chunk syscall storms), guaranteed buffer zeroization on early I/O errors, wiped temporary permutation arrays (`b`, `c`, `word_bytes`) in `permute_state`, replaced per-byte `format!` allocations in `squeeze_hex` with a zeroized lookup-table pipeline, and hardened `constant_time_eq` with `core::hint::black_box`.
+* **CLI Argument & Stream Accuracy Fixes:** Switched CLI parsing to raw `env::args_os()` without quote/whitespace stripping, prioritized existing filesystem paths over numeric `output_length` parsing, eliminated `/check` path-vs-hash argument swaps, and recorded hashed byte counts directly from the verified read stream.
 
 ---
 
