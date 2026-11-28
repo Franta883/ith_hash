@@ -1,12 +1,18 @@
 #![deny(unsafe_code)]
 
+use core::hint::black_box;
 use core::sync::atomic::{compiler_fence, Ordering};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const INTERNAL_HASH_HEX_LEN: usize = 128; // 512-bit internal security bound for Merkle nodes
+const MIN_CHECK_HEX_LEN: usize = 64; // 256-bit minimum digest length in /check mode
+const MAX_OUTPUT_HEX_LEN: usize = 1_048_576; // 1 MiB hex char DoS cap
+const READ_BUF_SIZE: usize = 65_536; // 64 KB zeroizing stack read buffer
+const DEFAULT_MAX_DEPTH: usize = 64; // Default directory traversal depth limit
 
 // Standard Profile (Opt-in): c = 1024 bits (16 lanes), r = 576 bits (9 lanes / 72 bytes)
 const STANDARD_RATE_WORDS: usize = 9;
@@ -22,6 +28,7 @@ const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_RED: &str = "\x1b[31m";
 const COLOR_CYAN: &str = "\x1b[36m";
+const COLOR_YELLOW: &str = "\x1b[33m";
 
 // Standard Keccak-f[1600] 24 round constants (Iota step)
 const KECCAK_RC: [u64; 24] = [
@@ -58,6 +65,16 @@ fn volatile_zero_u64_grid(grid: &mut [[u64; 5]; 5]) {
 }
 
 #[allow(unsafe_code)]
+fn volatile_zero_u64_slice(slice: &mut [u64]) {
+    for lane in slice.iter_mut() {
+        unsafe {
+            core::ptr::write_volatile(lane, 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+#[allow(unsafe_code)]
 fn volatile_zero_bytes(buf: &mut [u8]) {
     for byte in buf.iter_mut() {
         unsafe {
@@ -67,26 +84,50 @@ fn volatile_zero_bytes(buf: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-#[allow(unsafe_code)]
+/// Stack-allocated buffer that guarantees volatile zeroization on drop (including early `?` returns).
+struct ZeroizingBuf<const N: usize>([u8; N]);
+
+impl<const N: usize> ZeroizingBuf<N> {
+    fn new() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> Drop for ZeroizingBuf<N> {
+    fn drop(&mut self) {
+        volatile_zero_bytes(&mut self.0);
+    }
+}
+
+/// Heap-allocated byte vector that guarantees volatile zeroization on drop.
+struct ZeroizingVec(Vec<u8>);
+
+impl Drop for ZeroizingVec {
+    fn drop(&mut self) {
+        volatile_zero_bytes(&mut self.0);
+    }
+}
+
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut diff: u8 = 0;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+        diff = black_box(diff | black_box(x ^ y));
     }
-    // Prevent compiler from turning bitwise accumulation into a branch
-    unsafe { core::ptr::read_volatile(&diff) == 0 }
+    black_box(diff) == 0
 }
 
 // ========================================================================
 //  2. Hardened 3D Keccak-f[1600] Permutation (Theta, Rho, Pi, Chi, Iota)
 // ========================================================================
 fn permute_state(state: &mut [[u64; 5]; 5]) {
+    let mut c = [0u64; 5];
+    let mut b = [[0u64; 5]; 5];
+
     for round in 0..24 {
         // Theta (θ): Column parity mixing & 1-bit z-rotation
-        let mut c = [0u64; 5];
         for x in 0..5 {
             c[x] = state[x][0] ^ state[x][1] ^ state[x][2] ^ state[x][3] ^ state[x][4];
         }
@@ -98,7 +139,6 @@ fn permute_state(state: &mut [[u64; 5]; 5]) {
         }
 
         // Rho (ρ) & Pi (π): Z-axis rotation and transverse plane permutation
-        let mut b = [[0u64; 5]; 5];
         for x in 0..5 {
             for y in 0..5 {
                 b[y][(2 * x + 3 * y) % 5] = state[x][y].rotate_left(KECCAK_RHO[x][y]);
@@ -115,6 +155,9 @@ fn permute_state(state: &mut [[u64; 5]; 5]) {
         // Iota (ι): Round constant injection into lane (0, 0)
         state[0][0] ^= KECCAK_RC[round];
     }
+
+    volatile_zero_u64_slice(&mut c);
+    volatile_zero_u64_grid(&mut b);
 }
 
 // ========================================================================
@@ -189,26 +232,28 @@ impl IthHasher {
     fn absorb_rate_block(&mut self, block: &[u8]) {
         // Strict capacity isolation: only touch the first `rate_words` lanes
         // mapped via x = i % 5, y = i / 5
+        let mut word_bytes = ZeroizingBuf::<8>::new();
         for i in 0..self.rate_words {
             let start = i * 8;
-            let mut word_bytes = [0u8; 8];
-            word_bytes.copy_from_slice(&block[start..start + 8]);
+            word_bytes.0.copy_from_slice(&block[start..start + 8]);
             let x = i % 5;
             let y = i / 5;
-            self.state[x][y] ^= u64::from_le_bytes(word_bytes);
+            self.state[x][y] ^= u64::from_le_bytes(word_bytes.0);
         }
+        drop(word_bytes);
         permute_state(&mut self.state);
     }
 
     #[inline]
     fn extract_rate_block(&mut self) {
         // Strict capacity isolation: read only from the first `rate_words` lanes
+        let mut word_bytes = ZeroizingBuf::<8>::new();
         for i in 0..self.rate_words {
             let x = i % 5;
             let y = i / 5;
-            let word_bytes = self.state[x][y].to_le_bytes();
+            word_bytes.0 = self.state[x][y].to_le_bytes();
             let start = i * 8;
-            self.buffer[start..start + 8].copy_from_slice(&word_bytes);
+            self.buffer[start..start + 8].copy_from_slice(&word_bytes.0);
         }
         self.squeeze_offset = 0;
     }
@@ -230,10 +275,10 @@ impl IthHasher {
                 data = &data[take..];
 
                 if self.buf_len == self.rate_bytes {
-                    let mut local_block = [0u8; STANDARD_BLOCK];
-                    local_block[..self.rate_bytes].copy_from_slice(&self.buffer[..self.rate_bytes]);
-                    self.absorb_rate_block(&local_block[..self.rate_bytes]);
-                    volatile_zero_bytes(&mut local_block);
+                    let mut local_block = ZeroizingBuf::<STANDARD_BLOCK>::new();
+                    local_block.0[..self.rate_bytes]
+                        .copy_from_slice(&self.buffer[..self.rate_bytes]);
+                    self.absorb_rate_block(&local_block.0[..self.rate_bytes]);
                     self.buf_len = 0;
                 }
             }
@@ -259,10 +304,9 @@ impl IthHasher {
             self.buffer[self.rate_bytes - 1] = 0x80;
         }
 
-        let mut final_block = [0u8; STANDARD_BLOCK];
-        final_block[..self.rate_bytes].copy_from_slice(&self.buffer[..self.rate_bytes]);
-        self.absorb_rate_block(&final_block[..self.rate_bytes]);
-        volatile_zero_bytes(&mut final_block);
+        let mut final_block = ZeroizingBuf::<STANDARD_BLOCK>::new();
+        final_block.0[..self.rate_bytes].copy_from_slice(&self.buffer[..self.rate_bytes]);
+        self.absorb_rate_block(&final_block.0[..self.rate_bytes]);
 
         self.buf_len = 0;
         self.finalized = true;
@@ -292,17 +336,29 @@ impl IthHasher {
     }
 
     pub fn squeeze_hex(&mut self, target_char_len: usize) -> String {
-        let target_byte_len = (target_char_len + 1) / 2;
-        let mut output_bytes = vec![0u8; target_byte_len];
-        self.squeeze(&mut output_bytes);
+        assert!(
+            target_char_len <= MAX_OUTPUT_HEX_LEN,
+            "Requested output length {} exceeds maximum allowed ({} hex chars)",
+            target_char_len,
+            MAX_OUTPUT_HEX_LEN
+        );
 
-        let mut digest = String::with_capacity(target_char_len);
-        for &byte in &output_bytes {
-            digest.push_str(&format!("{:02x}", byte));
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+        let target_byte_len = (target_char_len + 1) / 2;
+        let mut output_bytes = ZeroizingVec(vec![0u8; target_byte_len]);
+        self.squeeze(&mut output_bytes.0);
+
+        let mut hex_bytes = Vec::with_capacity(target_char_len);
+        for &byte in &output_bytes.0 {
+            hex_bytes.push(HEX_CHARS[(byte >> 4) as usize]);
+            if hex_bytes.len() < target_char_len {
+                hex_bytes.push(HEX_CHARS[(byte & 0x0f) as usize]);
+            }
         }
-        volatile_zero_bytes(&mut output_bytes);
-        digest.truncate(target_char_len);
-        digest
+        drop(output_bytes);
+
+        String::from_utf8(hex_bytes).expect("HEX_CHARS produces valid ASCII UTF-8")
     }
 }
 
@@ -335,6 +391,8 @@ fn read_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usi
     Ok(total_read)
 }
 
+/// Hashes a file using a 64 KB zeroizing stack buffer fed in `BLOCK_SIZE_BYTES` sponge chunks.
+/// Returns `(hex_digest, actual_bytes_hashed)`.
 pub fn get_internal_tools_xof<
     const RATE_WORDS: usize,
     const BLOCK_SIZE_BYTES: usize,
@@ -342,7 +400,17 @@ pub fn get_internal_tools_xof<
 >(
     file_path: P,
     target_char_len: usize,
-) -> io::Result<String> {
+) -> io::Result<(String, u64)> {
+    if target_char_len > MAX_OUTPUT_HEX_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Requested output length {} exceeds maximum allowed ({} hex chars)",
+                target_char_len, MAX_OUTPUT_HEX_LEN
+            ),
+        ));
+    }
+
     let profile = if RATE_WORDS == STANDARD_RATE_WORDS {
         Profile::Standard
     } else {
@@ -351,24 +419,32 @@ pub fn get_internal_tools_xof<
 
     let mut hasher = IthHasher::new(profile);
     let mut file = File::open(file_path)?;
-    let mut buffer = [0u8; BLOCK_SIZE_BYTES];
+    let mut read_buf = ZeroizingBuf::<READ_BUF_SIZE>::new();
+    let mut bytes_hashed: u64 = 0;
 
     loop {
-        let bytes_read = read_full(&mut file, &mut buffer[..])?;
+        let bytes_read = read_full(&mut file, &mut read_buf.0)?;
         if bytes_read == 0 {
             break;
         }
-        hasher.absorb(&buffer[..bytes_read]);
-        if bytes_read < BLOCK_SIZE_BYTES {
+        bytes_hashed = bytes_hashed.checked_add(bytes_read as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Hashed byte counter overflowed u64")
+        })?;
+
+        for chunk in read_buf.0[..bytes_read].chunks(BLOCK_SIZE_BYTES) {
+            hasher.absorb(chunk);
+        }
+
+        if bytes_read < READ_BUF_SIZE {
             break;
         }
     }
 
-    volatile_zero_bytes(&mut buffer);
-    Ok(hasher.squeeze_hex(target_char_len))
+    drop(read_buf);
+    Ok((hasher.squeeze_hex(target_char_len), bytes_hashed))
 }
 
-fn run_hash(mode: &str, file_path: &str, char_len: usize) -> io::Result<String> {
+fn run_hash(mode: &str, file_path: &Path, char_len: usize) -> io::Result<(String, u64)> {
     if Profile::from_str(mode) == Profile::Standard {
         get_internal_tools_xof::<STANDARD_RATE_WORDS, STANDARD_BLOCK, _>(file_path, char_len)
     } else {
@@ -377,72 +453,178 @@ fn run_hash(mode: &str, file_path: &str, char_len: usize) -> io::Result<String> 
 }
 
 // ========================================================================
-//  5. Hardened Directory Traversal & Merkle Tree (Length-Prefixed)
+//  5. Hardened Iterative Directory Traversal & Merkle Tree
 // ========================================================================
-fn collect_directory_entries(
-    dir: &Path,
-    base_dir: &Path,
-    mode: &str,
-    file_count: &mut usize,
-    dir_count: &mut usize,
-    symlink_count: &mut usize,
-    total_size: &mut u64,
-    entries_out: &mut Vec<String>,
-) -> io::Result<()> {
-    let mut sorted_entries = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        sorted_entries.push(entry?);
+/// Encodes path components unambiguously without normalizing separators or losing non-UTF-8 bytes:
+/// `[component_count: u64 LE] ([component_len: u64 LE][raw_os_str_bytes])*`
+fn encode_path_components(path: &Path, out: &mut Vec<u8>) {
+    let components: Vec<_> = path.components().collect();
+    out.extend_from_slice(&(components.len() as u64).to_le_bytes());
+    for comp in components {
+        let bytes = comp.as_os_str().as_encoded_bytes();
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
     }
-    sorted_entries.sort_by_key(|e| e.path());
+}
 
-    for entry in sorted_entries {
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        let rel_path = path
-            .strip_prefix(base_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if file_type.is_symlink() {
-            *symlink_count += 1;
-            let target = fs::read_link(&path)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| "<unreadable>".to_string());
-            let record = format!(
-                "SYMLINK:{}:{}:{}:{}",
-                rel_path.len(),
-                rel_path,
-                target.len(),
-                target
-            );
-            entries_out.push(hash_bytes_xof(mode, record.as_bytes(), INTERNAL_HASH_HEX_LEN));
-        } else if file_type.is_dir() {
-            *dir_count += 1;
-            let record = format!("DIR:{}:{}", rel_path.len(), rel_path);
-            entries_out.push(hash_bytes_xof(mode, record.as_bytes(), INTERNAL_HASH_HEX_LEN));
-            collect_directory_entries(
-                &path,
-                base_dir,
-                mode,
-                file_count,
-                dir_count,
-                symlink_count,
-                total_size,
-                entries_out,
-            )?;
-        } else if file_type.is_file() {
-            *file_count += 1;
-            let meta = entry.metadata()?;
-            let size = meta.len();
-            *total_size += size;
-
-            let path_str = path.to_string_lossy();
-            let content_hash = run_hash(mode, &path_str, INTERNAL_HASH_HEX_LEN)?;
-            let record = format!("FILE:{}:{}:{}:{}", rel_path.len(), rel_path, size, content_hash);
-            entries_out.push(hash_bytes_xof(mode, record.as_bytes(), INTERNAL_HASH_HEX_LEN));
+fn special_file_type_label(_ft: &fs::FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            return "fifo";
+        }
+        if ft.is_socket() {
+            return "socket";
+        }
+        if ft.is_block_device() {
+            return "block_device";
+        }
+        if ft.is_char_device() {
+            return "char_device";
         }
     }
+    "other"
+}
+
+struct DirStats {
+    file_count: usize,
+    dir_count: usize,
+    symlink_count: usize,
+    special_count: usize,
+    total_size: u64,
+}
+
+enum WorkItem {
+    Dir { path: PathBuf, depth: usize },
+    Entry { entry: fs::DirEntry, depth: usize },
+}
+
+fn collect_directory_entries(
+    root_dir: &Path,
+    mode: &str,
+    max_depth: usize,
+    stats: &mut DirStats,
+    entries_out: &mut Vec<String>,
+) -> io::Result<()> {
+    let mut stack = vec![WorkItem::Dir {
+        path: root_dir.to_path_buf(),
+        depth: 0,
+    }];
+
+    while let Some(item) = stack.pop() {
+        match item {
+            WorkItem::Dir { path, depth } => {
+                let mut sorted_entries = Vec::new();
+                for entry in fs::read_dir(&path)? {
+                    sorted_entries.push(entry?);
+                }
+                sorted_entries.sort_by(|a, b| {
+                    a.file_name()
+                        .as_encoded_bytes()
+                        .cmp(b.file_name().as_encoded_bytes())
+                });
+
+                // Push in reverse order so LIFO pop preserves deterministic lexicographical DFS order.
+                for entry in sorted_entries.into_iter().rev() {
+                    stack.push(WorkItem::Entry { entry, depth });
+                }
+            }
+            WorkItem::Entry { entry, depth } => {
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                let rel_path = path.strip_prefix(root_dir).unwrap_or(&path);
+
+                let mut record = Vec::new();
+
+                if file_type.is_symlink() {
+                    stats.symlink_count += 1;
+                    record.extend_from_slice(b"SYMLINK:");
+                    encode_path_components(rel_path, &mut record);
+
+                    match fs::read_link(&path) {
+                        Ok(target) => {
+                            let target_bytes = target.as_os_str().as_encoded_bytes();
+                            record.extend_from_slice(b"TARGET:");
+                            record.extend_from_slice(&(target_bytes.len() as u64).to_le_bytes());
+                            record.extend_from_slice(target_bytes);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "{}Warning: unreadable symlink '{}': {}{}",
+                                COLOR_YELLOW,
+                                path.display(),
+                                err,
+                                COLOR_RESET
+                            );
+                            record.extend_from_slice(b"ERROR:");
+                            if let Some(errno) = err.raw_os_error() {
+                                record.extend_from_slice(b"ERRNO:");
+                                record.extend_from_slice(&errno.to_le_bytes());
+                            } else {
+                                let kind_str = format!("{:?}", err.kind());
+                                record.extend_from_slice(b"KIND:");
+                                record.extend_from_slice(&(kind_str.len() as u64).to_le_bytes());
+                                record.extend_from_slice(kind_str.as_bytes());
+                            }
+                        }
+                    }
+
+                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                } else if file_type.is_dir() {
+                    stats.dir_count += 1;
+                    record.extend_from_slice(b"DIR:");
+                    encode_path_components(rel_path, &mut record);
+                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+
+                    if depth >= max_depth {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Maximum directory traversal depth ({}) exceeded at '{}'",
+                                max_depth,
+                                path.display()
+                            ),
+                        ));
+                    }
+
+                    stack.push(WorkItem::Dir {
+                        path,
+                        depth: depth + 1,
+                    });
+                } else if file_type.is_file() {
+                    stats.file_count += 1;
+                    let (content_hash, bytes_hashed) = run_hash(mode, &path, INTERNAL_HASH_HEX_LEN)?;
+                    stats.total_size = stats.total_size.checked_add(bytes_hashed).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Total size overflowed u64")
+                    })?;
+
+                    record.extend_from_slice(b"FILE:");
+                    encode_path_components(rel_path, &mut record);
+                    record.extend_from_slice(&bytes_hashed.to_le_bytes());
+                    record.extend_from_slice(content_hash.as_bytes());
+                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                } else {
+                    stats.special_count += 1;
+                    let kind_label = special_file_type_label(&file_type);
+                    eprintln!(
+                        "{}Warning: special file ({}) encountered at '{}'{}",
+                        COLOR_YELLOW,
+                        kind_label,
+                        path.display(),
+                        COLOR_RESET
+                    );
+
+                    record.extend_from_slice(b"SPECIAL:");
+                    encode_path_components(rel_path, &mut record);
+                    record.extend_from_slice(&(kind_label.len() as u64).to_le_bytes());
+                    record.extend_from_slice(kind_label.as_bytes());
+                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -451,69 +633,77 @@ fn compute_merkle_root(mode: &str, mut hashes: Vec<String>, final_char_len: usiz
         return hash_bytes_xof(mode, b"MERKLE_EMPTY_TREE", final_char_len);
     }
 
+    // Always domain-separate 1-entry directories with NODE_ODD: + ROOT_FINAL:
+    if hashes.len() == 1 {
+        let single_combined = format!("NODE_ODD:{}", hashes.remove(0));
+        let single_node = hash_bytes_xof(mode, single_combined.as_bytes(), INTERNAL_HASH_HEX_LEN);
+        let root_payload = format!("ROOT_FINAL:{}", single_node);
+        return hash_bytes_xof(mode, root_payload.as_bytes(), final_char_len);
+    }
+
     while hashes.len() > 1 {
         let mut next_level = Vec::with_capacity((hashes.len() + 1) / 2);
-        let is_last_level = hashes.len() <= 2;
-        let target_len = if is_last_level {
-            final_char_len
-        } else {
-            INTERNAL_HASH_HEX_LEN
-        };
-
         for chunk in hashes.chunks(2) {
             if chunk.len() == 2 {
                 let combined = format!("NODE:{}:{}", chunk[0], chunk[1]);
-                next_level.push(hash_bytes_xof(mode, combined.as_bytes(), target_len));
+                next_level.push(hash_bytes_xof(
+                    mode,
+                    combined.as_bytes(),
+                    INTERNAL_HASH_HEX_LEN,
+                ));
             } else {
                 let combined = format!("NODE_ODD:{}", chunk[0]);
-                next_level.push(hash_bytes_xof(mode, combined.as_bytes(), target_len));
+                next_level.push(hash_bytes_xof(
+                    mode,
+                    combined.as_bytes(),
+                    INTERNAL_HASH_HEX_LEN,
+                ));
             }
         }
         hashes = next_level;
     }
 
     let root = hashes.remove(0);
-    if root.len() == final_char_len {
-        root
-    } else {
-        hash_bytes_xof(
-            mode,
-            format!("ROOT_FINAL:{}", root).as_bytes(),
-            final_char_len,
-        )
-    }
+    let root_payload = format!("ROOT_FINAL:{}", root);
+    hash_bytes_xof(mode, root_payload.as_bytes(), final_char_len)
 }
 
 // ========================================================================
-//  6. Order-Independent CLI Parser & Verification
+//  6. Strict CLI Parser & Verification
 // ========================================================================
 fn is_valid_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn clean_arg(s: &str) -> String {
-    let mut out = s.trim();
-    while out.len() >= 2
-        && ((out.starts_with('"') && out.ends_with('"'))
-            || (out.starts_with('\'') && out.ends_with('\'')))
-    {
-        out = &out[1..out.len() - 1];
+fn parse_prefixed_usize(lower: &str, prefixes: &[&str]) -> Option<Result<usize, String>> {
+    for prefix in prefixes {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            return Some(
+                rest.parse::<usize>()
+                    .map_err(|_| format!("invalid numeric value for '{}': '{}'", prefix, rest)),
+            );
+        }
     }
-    out.trim().to_string()
+    None
 }
 
 fn print_usage() {
     println!("--- ITH-XOF Cryptographic Hash Engine (Hardened 3D Sponge) ---");
     println!("Usage:");
-    println!("  ith_hash [/paranoid|/standard] <file_path> [output_length]");
-    println!("  ith_hash [/paranoid|/standard] /folder [/usemerkletree] <dir_path> [output_length]");
+    println!("  ith_hash [flags] [--] <file_path> [output_length]");
+    println!("  ith_hash [flags] /folder [/usemerkletree] [--] <dir_path> [output_length]");
     println!();
     println!("Verification:");
-    println!("  ith_hash [/paranoid|/standard] [/folder [/usemerkletree]] <path> /check <expected_hash>");
+    println!("  ith_hash [flags] /check [--] <path> <expected_hash>");
     println!();
-    println!("  Profile       : defaults to /paranoid (c=1536, r=64); opt-in /standard (c=1024, r=576)");
-    println!("  output_length : default 64 hex characters (min 32 in /check mode)");
-    println!("  Flags and arguments may be supplied in any order.");
+    println!("Flags:");
+    println!("  /paranoid | /standard : profile (default: /paranoid, c=1536, r=64; /standard: c=1024, r=576)");
+    println!("  /folder               : hash directory contents");
+    println!("  /usemerkletree        : compute Merkle root (requires /folder)");
+    println!("  /check                : verify <path> against <expected_hash> (strict positional order)");
+    println!("  /len:<N>              : explicit output/expected hex length (1..={}, min {} in /check)", MAX_OUTPUT_HEX_LEN, MIN_CHECK_HEX_LEN);
+    println!("  /maxdepth:<N>         : max directory traversal depth (default: {})", DEFAULT_MAX_DEPTH);
+    println!("  --                    : end of flags; treat all remaining arguments as positional");
 }
 
 fn verify_or_print(computed: &str, check_mode: bool, expected_hash: Option<String>) {
@@ -543,14 +733,8 @@ fn verify_or_print(computed: &str, check_mode: bool, expected_hash: Option<Strin
 }
 
 fn main() {
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    let args: Vec<String> = raw_args
-        .iter()
-        .map(|s| clean_arg(s))
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if args.is_empty() {
+    let raw_args: Vec<OsString> = env::args_os().skip(1).collect();
+    if raw_args.is_empty() {
         print_usage();
         return;
     }
@@ -560,27 +744,93 @@ fn main() {
     let mut folder_mode = false;
     let mut merkle_mode = false;
     let mut check_mode = false;
-    let mut numeric_buffer: Vec<usize> = Vec::new();
-    let mut non_flag_tokens: Vec<String> = Vec::new();
+    let mut explicit_len: Option<usize> = None;
+    let mut max_depth: usize = DEFAULT_MAX_DEPTH;
+    let mut end_of_flags = false;
+    let mut positional: Vec<OsString> = Vec::new();
 
-    for arg in &args {
-        let lower = arg.to_lowercase();
-        match lower.as_str() {
-            "/standard" | "--standard" | "-standard" => mode = "standard",
-            "/paranoid" | "--paranoid" | "-paranoid" => mode = "paranoid",
-            "/folder" | "--folder" | "-folder" => folder_mode = true,
-            "/usemerkletree" | "--usemerkletree" | "-usemerkletree" => merkle_mode = true,
-            "/check" | "--check" | "-check" => check_mode = true,
-            _ => {
-                if let Ok(n) = arg.parse::<usize>() {
-                    if n > 0 {
-                        numeric_buffer.push(n);
+    for arg in raw_args {
+        if !end_of_flags {
+            if let Some(s) = arg.to_str() {
+                if s == "--" {
+                    end_of_flags = true;
+                    continue;
+                }
+
+                let lower = s.to_ascii_lowercase();
+                match lower.as_str() {
+                    "/standard" | "--standard" | "-standard" => {
+                        mode = "standard";
+                        continue;
                     }
-                } else {
-                    non_flag_tokens.push(arg.clone());
+                    "/paranoid" | "--paranoid" | "-paranoid" => {
+                        mode = "paranoid";
+                        continue;
+                    }
+                    "/folder" | "--folder" | "-folder" => {
+                        folder_mode = true;
+                        continue;
+                    }
+                    "/usemerkletree" | "--usemerkletree" | "-usemerkletree" => {
+                        merkle_mode = true;
+                        continue;
+                    }
+                    "/check" | "--check" | "-check" => {
+                        check_mode = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if let Some(parsed) = parse_prefixed_usize(
+                    &lower,
+                    &["/len:", "--len:", "-len:", "/len=", "--len=", "-len="],
+                ) {
+                    match parsed {
+                        Ok(n) if (1..=MAX_OUTPUT_HEX_LEN).contains(&n) => {
+                            explicit_len = Some(n);
+                            continue;
+                        }
+                        Ok(n) => {
+                            eprintln!(
+                                "{}Error: /len must be between 1 and {} (got {}).{}",
+                                COLOR_RED, MAX_OUTPUT_HEX_LEN, n, COLOR_RESET
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(msg) => {
+                            eprintln!("{}Error: {}{}", COLOR_RED, msg, COLOR_RESET);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                if let Some(parsed) = parse_prefixed_usize(
+                    &lower,
+                    &[
+                        "/maxdepth:",
+                        "--maxdepth:",
+                        "-maxdepth:",
+                        "/maxdepth=",
+                        "--maxdepth=",
+                        "-maxdepth=",
+                    ],
+                ) {
+                    match parsed {
+                        Ok(n) => {
+                            max_depth = n;
+                            continue;
+                        }
+                        Err(msg) => {
+                            eprintln!("{}Error: {}{}", COLOR_RED, msg, COLOR_RESET);
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
+
+        positional.push(arg);
     }
 
     if merkle_mode && !folder_mode {
@@ -591,77 +841,167 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut target_path: Option<String> = None;
-    let mut expected_hash: Option<String> = None;
+    let target_path: PathBuf;
+    let expected_hash: Option<String>;
+    let char_len: usize;
 
     if check_mode {
-        for token in &non_flag_tokens {
-            let p = Path::new(token);
-            if target_path.is_none() && p.exists() {
-                target_path = Some(token.clone());
-            } else if expected_hash.is_none() && is_valid_hex(token) {
-                expected_hash = Some(token.to_lowercase());
-            } else if target_path.is_none() {
-                target_path = Some(token.clone());
-            } else if expected_hash.is_none() {
-                expected_hash = Some(token.to_lowercase());
-            }
+        // Strict positional order: <path> <expected_hash>
+        if positional.len() != 2 {
+            eprintln!(
+                "{}Error: /check requires exact positional arguments: <path> <expected_hash>{}",
+                COLOR_RED, COLOR_RESET
+            );
+            print_usage();
+            std::process::exit(1);
         }
 
-        if let Some(ref h) = expected_hash {
-            if !is_valid_hex(h) || h.len() < 32 {
+        target_path = PathBuf::from(&positional[0]);
+        let expected_str = match positional[1].to_str() {
+            Some(s) => s,
+            None => {
                 eprintln!(
-                    "{}Error: /check requires a valid hex hash of at least 32 characters (128 bits).{}",
+                    "{}Error: expected hash in /check must be valid UTF-8 ASCII hex.{}",
                     COLOR_RED, COLOR_RESET
                 );
                 std::process::exit(1);
             }
-        }
-    } else if !non_flag_tokens.is_empty() {
-        target_path = Some(non_flag_tokens[0].clone());
-    }
+        };
 
-    let path_str = match target_path {
-        Some(p) => p,
-        None => {
-            eprintln!("{}Error: no target path provided.{}", COLOR_RED, COLOR_RESET);
-            print_usage();
-            std::process::exit(1);
-        }
-    };
-
-    let char_len = if check_mode {
-        expected_hash.as_ref().map(|h| h.len()).unwrap_or(64)
-    } else {
-        numeric_buffer.first().copied().unwrap_or(64)
-    };
-
-    if folder_mode {
-        let target_dir = Path::new(&path_str);
-        if !target_dir.is_dir() {
+        if !is_valid_hex(expected_str) {
             eprintln!(
-                "{}Error: not a valid directory: {}{}",
-                COLOR_RED, path_str, COLOR_RESET
+                "{}Error: expected hash in /check must contain only hexadecimal characters.{}",
+                COLOR_RED, COLOR_RESET
             );
             std::process::exit(1);
         }
 
-        let mut file_count = 0;
-        let mut dir_count = 0;
-        let mut symlink_count = 0;
-        let mut total_size = 0u64;
+        if expected_str.len() < MIN_CHECK_HEX_LEN {
+            eprintln!(
+                "{}Error: /check requires a hash of at least {} hex characters ({} bits) to prevent truncation downgrades.{}",
+                COLOR_RED,
+                MIN_CHECK_HEX_LEN,
+                MIN_CHECK_HEX_LEN * 4,
+                COLOR_RESET
+            );
+            std::process::exit(1);
+        }
+
+        if expected_str.len() > MAX_OUTPUT_HEX_LEN {
+            eprintln!(
+                "{}Error: expected hash length ({}) exceeds maximum allowed ({} hex chars).{}",
+                COLOR_RED,
+                expected_str.len(),
+                MAX_OUTPUT_HEX_LEN,
+                COLOR_RESET
+            );
+            std::process::exit(1);
+        }
+
+        if let Some(req_len) = explicit_len {
+            if req_len < MIN_CHECK_HEX_LEN {
+                eprintln!(
+                    "{}Error: /len in /check mode must be at least {} hex characters ({} bits).{}",
+                    COLOR_RED,
+                    MIN_CHECK_HEX_LEN,
+                    MIN_CHECK_HEX_LEN * 4,
+                    COLOR_RESET
+                );
+                std::process::exit(1);
+            }
+            if expected_str.len() != req_len {
+                eprintln!(
+                    "{}Error: expected hash length ({}) does not match explicit /len:{} requirement.{}",
+                    COLOR_RED,
+                    expected_str.len(),
+                    req_len,
+                    COLOR_RESET
+                );
+                std::process::exit(1);
+            }
+            char_len = req_len;
+        } else {
+            char_len = expected_str.len();
+        }
+
+        expected_hash = Some(expected_str.to_ascii_lowercase());
+    } else {
+        if positional.is_empty() || positional.len() > 2 {
+            eprintln!(
+                "{}Error: expected <path> [output_length] (got {} positional arguments).{}",
+                COLOR_RED,
+                positional.len(),
+                COLOR_RESET
+            );
+            print_usage();
+            std::process::exit(1);
+        }
+
+        // First positional argument is always <path>, even if numeric (e.g., "12345" or "2026").
+        target_path = PathBuf::from(&positional[0]);
+        expected_hash = None;
+
+        if positional.len() == 2 {
+            if explicit_len.is_some() {
+                eprintln!(
+                    "{}Error: output length specified both via /len and positional argument.{}",
+                    COLOR_RED, COLOR_RESET
+                );
+                std::process::exit(1);
+            }
+
+            let len_arg = &positional[1];
+            let parsed_len = len_arg
+                .to_str()
+                .and_then(|s| s.parse::<usize>().ok());
+
+            match parsed_len {
+                Some(n) if (1..=MAX_OUTPUT_HEX_LEN).contains(&n) => char_len = n,
+                Some(n) => {
+                    eprintln!(
+                        "{}Error: output_length must be between 1 and {} (got {}).{}",
+                        COLOR_RED, MAX_OUTPUT_HEX_LEN, n, COLOR_RESET
+                    );
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!(
+                        "{}Error: invalid output_length '{}'. Use /len:<N> or a positive integer.{}",
+                        COLOR_RED,
+                        Path::new(len_arg).display(),
+                        COLOR_RESET
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            char_len = explicit_len.unwrap_or(64);
+        }
+    }
+
+    if folder_mode {
+        if !target_path.is_dir() {
+            eprintln!(
+                "{}Error: not a valid directory: {}{}",
+                COLOR_RED,
+                target_path.display(),
+                COLOR_RESET
+            );
+            std::process::exit(1);
+        }
+
+        let mut stats = DirStats {
+            file_count: 0,
+            dir_count: 0,
+            symlink_count: 0,
+            special_count: 0,
+            total_size: 0,
+        };
         let mut leaf_hashes = Vec::new();
 
-        if let Err(e) = collect_directory_entries(
-            target_dir,
-            target_dir,
-            mode,
-            &mut file_count,
-            &mut dir_count,
-            &mut symlink_count,
-            &mut total_size,
-            &mut leaf_hashes,
-        ) {
+        if let Err(e) =
+            collect_directory_entries(&target_path, mode, max_depth, &mut stats, &mut leaf_hashes)
+        {
             eprintln!("{}Error scanning directory: {}{}", COLOR_RED, e, COLOR_RESET);
             std::process::exit(1);
         }
@@ -670,8 +1010,12 @@ fn main() {
             compute_merkle_root(mode, leaf_hashes, char_len)
         } else {
             let mut manifest = format!(
-                "MANIFEST:{}:{}:{}:{}\n",
-                file_count, dir_count, symlink_count, total_size
+                "MANIFEST:{}:{}:{}:{}:{}\n",
+                stats.file_count,
+                stats.dir_count,
+                stats.symlink_count,
+                stats.special_count,
+                stats.total_size
             );
             for h in &leaf_hashes {
                 manifest.push_str(h);
@@ -686,10 +1030,14 @@ fn main() {
             } else {
                 "Directory Content Hash"
             };
-            println!("=== {}: {} ===", label, target_dir.to_string_lossy());
+            println!("=== {}: {} ===", label, target_path.display());
             println!(
-                "Files: {}, Folders: {}, Symlinks: {}, Total size: {} bytes",
-                file_count, dir_count, symlink_count, total_size
+                "Files: {}, Folders: {}, Symlinks: {}, Special: {}, Total size: {} bytes",
+                stats.file_count,
+                stats.dir_count,
+                stats.symlink_count,
+                stats.special_count,
+                stats.total_size
             );
         }
 
@@ -697,13 +1045,18 @@ fn main() {
         return;
     }
 
-    if !Path::new(&path_str).is_file() {
-        eprintln!("{}Error: file not found: {}{}", COLOR_RED, path_str, COLOR_RESET);
+    if !target_path.is_file() {
+        eprintln!(
+            "{}Error: file not found: {}{}",
+            COLOR_RED,
+            target_path.display(),
+            COLOR_RESET
+        );
         std::process::exit(1);
     }
 
-    match run_hash(mode, &path_str, char_len) {
-        Ok(computed) => verify_or_print(&computed, check_mode, expected_hash),
+    match run_hash(mode, &target_path, char_len) {
+        Ok((computed, _bytes_hashed)) => verify_or_print(&computed, check_mode, expected_hash),
         Err(e) => {
             eprintln!("{}Error reading target file: {}{}", COLOR_RED, e, COLOR_RESET);
             std::process::exit(1);
