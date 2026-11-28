@@ -1,18 +1,3 @@
-//! ITH-XOF Cryptographic Hash Engine (Hardened 3D Sponge)
-//!
-//! # Scoped `unsafe` Boundary Documentation
-//! Crate-wide `#![deny(unsafe_code)]` has been replaced with function-scoped
-//! `#[allow(unsafe_code)]` blocks restricted strictly to two audited boundaries:
-//! 1. **Volatile Memory Zeroization (`core::ptr::write_volatile`)**:
-//!    Used in `volatile_zero_u64_grid`, `volatile_zero_u64_slice`, `volatile_zero_bytes`,
-//!    `volatile_zero_vec_capacity`, `absorb_rate_block`, and `extract_rate_block`
-//!    (followed by `compiler_fence(Ordering::SeqCst)`) to guarantee stack temporaries
-//!    and full heap capacities (`0..vec.capacity()`) are scrubbed before deallocation.
-//! 2. **Filesystem TOCTOU Pinning (`openat` / `fstatat` / `readlinkat` & `GetFileInformationByHandle`)**:
-//!    Used on Unix to anchor directory traversal and file access to opened directory file
-//!    descriptors with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` and `AT_SYMLINK_NOFOLLOW`,
-//!    and on Windows to verify `FILE_FLAG_OPEN_REPARSE_POINT` handles via `GetFileInformationByHandle`.
-
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::fmt;
@@ -27,27 +12,24 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
 
-const INTERNAL_HASH_HEX_LEN: usize = 128; // 512-bit canonical default & internal Merkle bound
-const MIN_CHECK_HEX_LEN: usize = 64; // 256-bit minimum digest length across generation & /check
-const MAX_OUTPUT_HEX_LEN: usize = 1_048_576; // 1 MiB hex char DoS cap
-const READ_BUF_SIZE: usize = 65_536; // 64 KB zeroizing stack read buffer
-const DEFAULT_MAX_DEPTH: usize = 64; // Default directory traversal depth limit
+const INTERNAL_HASH_HEX_LEN: usize = 128;
+const MIN_CHECK_HEX_LEN: usize = 64;
+const MAX_OUTPUT_HEX_LEN: usize = 1_048_576;
+const READ_BUF_SIZE: usize = 65_536;
+const DEFAULT_MAX_DEPTH: usize = 64;
 
-// Mandatory 1-byte sponge object-type domain prefixes (Fix 1.2)
-pub const OBJ_DOMAIN_FILE_DATA: u8 = 0x00; // Raw single-file stream (FILE_DATA)
-pub const OBJ_DOMAIN_MERKLE_LEAF: u8 = 0x01; // Merkle leaf record (MERKLE_LEAF)
-pub const OBJ_DOMAIN_MERKLE_NODE: u8 = 0x02; // Merkle internal node (MERKLE_NODE)
-pub const OBJ_DOMAIN_DIR_ROOT: u8 = 0x03; // Directory manifest / root (DIR_ROOT)
+pub const OBJ_DOMAIN_FILE_DATA: u8 = 0x00;
+pub const OBJ_DOMAIN_MERKLE_LEAF: u8 = 0x01;
+pub const OBJ_DOMAIN_MERKLE_NODE: u8 = 0x02;
+pub const OBJ_DOMAIN_DIR_ROOT: u8 = 0x03;
 
-// Standard Profile (Opt-in): c = 1024 bits (16 lanes), r = 576 bits (9 lanes / 72 bytes)
 const STANDARD_RATE_WORDS: usize = 9;
-const STANDARD_BLOCK: usize = STANDARD_RATE_WORDS * 8; // 72 bytes
-const DOMAIN_STANDARD: u8 = 0x0A; // domain bits `10` + pad10*1 start bit `1`
+const STANDARD_BLOCK: usize = STANDARD_RATE_WORDS * 8;
+const DOMAIN_STANDARD: u8 = 0x0A;
 
-// Paranoid Profile (Default): c = 1536 bits (24 lanes), r = 64 bits (1 lane / 8 bytes)
 const PARANOID_RATE_WORDS: usize = 1;
-const PARANOID_BLOCK: usize = PARANOID_RATE_WORDS * 8; // 8 bytes
-const DOMAIN_PARANOID: u8 = 0x06; // domain bits `01` + pad10*1 start bit `1`
+const PARANOID_BLOCK: usize = PARANOID_RATE_WORDS * 8;
+const DOMAIN_PARANOID: u8 = 0x06;
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_GREEN: &str = "\x1b[32m";
@@ -55,7 +37,6 @@ const COLOR_RED: &str = "\x1b[31m";
 const COLOR_CYAN: &str = "\x1b[36m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 
-// Standard Keccak-f[1600] 24 round constants (Iota step)
 const KECCAK_RC: [u64; 24] = [
     0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
     0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
@@ -65,18 +46,14 @@ const KECCAK_RC: [u64; 24] = [
     0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
 ];
 
-// 3D-indexed rotation offsets KECCAK_RHO[x][y]
 const KECCAK_RHO: [[u32; 5]; 5] = [
-    [ 0, 36,  3, 41, 18], // x = 0, y = 0..5
-    [ 1, 44, 10, 45,  2], // x = 1, y = 0..5
-    [62,  6, 43, 15, 61], // x = 2, y = 0..5
-    [28, 55, 25, 21, 56], // x = 3, y = 0..5
-    [27, 20, 39,  8, 14], // x = 4, y = 0..5
+    [ 0, 36,  3, 41, 18],
+    [ 1, 44, 10, 45,  2],
+    [62,  6, 43, 15, 61],
+    [28, 55, 25, 21, 56],
+    [27, 20, 39,  8, 14],
 ];
 
-// ========================================================================
-//  0. Scoped Platform FFI Declarations for TOCTOU Pinning
-// ========================================================================
 #[cfg(unix)]
 #[allow(non_camel_case_types, dead_code)]
 mod libc {
@@ -281,7 +258,7 @@ mod win_ffi {
     }
 
     #[link(name = "kernel32")]
-    unsafe extern "system" {
+    extern "system" {
         pub fn GetFileInformationByHandle(
             h_file: *mut core::ffi::c_void,
             lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
@@ -289,9 +266,6 @@ mod win_ffi {
     }
 }
 
-// ========================================================================
-//  1. Audited Side-Channel Hygiene, Sanitization & Volatile Zeroization
-// ========================================================================
 #[allow(unsafe_code)]
 fn volatile_zero_u64_grid(grid: &mut [[u64; 5]; 5]) {
     for row in grid.iter_mut() {
@@ -336,7 +310,6 @@ fn volatile_zero_vec_capacity(vec: &mut Vec<u8>) {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// Stack-allocated buffer that guarantees volatile zeroization on drop (including early `?` returns).
 struct ZeroizingBuf<const N: usize>([u8; N]);
 
 impl<const N: usize> ZeroizingBuf<N> {
@@ -351,7 +324,6 @@ impl<const N: usize> Drop for ZeroizingBuf<N> {
     }
 }
 
-/// Heap-allocated byte vector that guarantees volatile zeroization across its full capacity on drop.
 pub struct ZeroizingVec(pub Vec<u8>);
 
 impl ZeroizingVec {
@@ -366,7 +338,6 @@ impl Drop for ZeroizingVec {
     }
 }
 
-/// Heap-allocated string that guarantees volatile zeroization across its full capacity on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ZeroizingString(String);
 
@@ -424,7 +395,6 @@ impl Drop for ZeroizingString {
     }
 }
 
-/// Branchless constant-time nibble-to-lowercase-hex conversion (Fix 3.1).
 #[inline]
 fn nibble_to_hex(n: u8) -> u8 {
     let n = n & 0x0f;
@@ -443,8 +413,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     black_box(diff) == 0
 }
 
-/// Escapes C0 (`0x00..=0x1F`) and C1 (`0x7F..=0x9F`) control characters as `\xNN`
-/// to prevent terminal ANSI escape sequence injection / line spoofing (Fix 2.2).
 pub fn sanitize_display(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -463,15 +431,11 @@ pub fn sanitize_path_display(path: &Path) -> String {
     sanitize_display(&path.to_string_lossy())
 }
 
-// ========================================================================
-//  2. Hardened 3D Keccak-f[1600] Permutation (Theta, Rho, Pi, Chi, Iota)
-// ========================================================================
 fn permute_state(state: &mut [[u64; 5]; 5]) {
     let mut c = [0u64; 5];
     let mut b = [[0u64; 5]; 5];
 
     for round in 0..24 {
-        // Theta (θ): Column parity mixing & 1-bit z-rotation
         for x in 0..5 {
             c[x] = state[x][0] ^ state[x][1] ^ state[x][2] ^ state[x][3] ^ state[x][4];
         }
@@ -482,21 +446,18 @@ fn permute_state(state: &mut [[u64; 5]; 5]) {
             }
         }
 
-        // Rho (ρ) & Pi (π): Z-axis rotation and transverse plane permutation
         for x in 0..5 {
             for y in 0..5 {
                 b[y][(2 * x + 3 * y) % 5] = state[x][y].rotate_left(KECCAK_RHO[x][y]);
             }
         }
 
-        // Chi (χ): Row-wise non-linear degree-2 mapping
         for x in 0..5 {
             for y in 0..5 {
                 state[x][y] = b[x][y] ^ ((!b[(x + 1) % 5][y]) & b[(x + 2) % 5][y]);
             }
         }
 
-        // Iota (ι): Round constant injection into lane (0, 0)
         state[0][0] ^= KECCAK_RC[round];
     }
 
@@ -504,9 +465,6 @@ fn permute_state(state: &mut [[u64; 5]; 5]) {
     volatile_zero_u64_grid(&mut b);
 }
 
-// ========================================================================
-//  3. Stateful Sponge Engine with Strict Capacity Isolation & Phase Lock
-// ========================================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Paranoid,
@@ -580,12 +538,10 @@ pub struct IthHasher {
 }
 
 impl IthHasher {
-    /// Creates a sponge pre-initialized with the mandatory 1-byte `OBJ_DOMAIN_FILE_DATA` (`0x00`) prefix.
     pub fn new(profile: Profile) -> Self {
         Self::new_with_domain(profile, OBJ_DOMAIN_FILE_DATA)
     }
 
-    /// Creates a sponge pre-initialized with a mandatory 1-byte object-type domain tag (Fix 1.2).
     pub fn new_with_domain(profile: Profile, obj_domain: u8) -> Self {
         let mut buffer = [0u8; STANDARD_BLOCK];
         buffer[0] = obj_domain;
@@ -604,8 +560,6 @@ impl IthHasher {
     #[inline]
     #[allow(unsafe_code)]
     fn absorb_rate_block(&mut self, block: &[u8]) {
-        // Strict capacity isolation: only touch the first `rate_words` lanes
-        // mapped via x = i % 5, y = i / 5
         let mut word_bytes = ZeroizingBuf::<8>::new();
         let mut lane_val: u64 = 0;
         for i in 0..self.rate_words {
@@ -627,7 +581,6 @@ impl IthHasher {
     #[inline]
     #[allow(unsafe_code)]
     fn extract_rate_block(&mut self) {
-        // Strict capacity isolation: read only from the first `rate_words` lanes
         let mut lane_val: u64 = 0;
         for i in 0..self.rate_words {
             let x = i % 5;
@@ -751,9 +704,6 @@ impl Drop for IthHasher {
     }
 }
 
-// ========================================================================
-//  4. High-Level Byte & File XOF Helpers (TOCTOU-Hardened)
-// ========================================================================
 pub fn hash_domain_bytes_xof(
     profile: Profile,
     obj_domain: u8,
@@ -793,7 +743,6 @@ fn read_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usi
     Ok(total_read)
 }
 
-/// Opens a regular file without following symlinks and verifies its descriptor/handle metadata (Fix 2.4).
 fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::Metadata)> {
     #[cfg(unix)]
     {
@@ -876,7 +825,6 @@ fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::Metadata)> 
     }
 }
 
-/// Hashes an already-opened and verified file descriptor using a 64 KB zeroizing stack buffer.
 fn hash_open_file_xof(
     profile: Profile,
     file: &mut File,
@@ -915,8 +863,6 @@ fn hash_open_file_xof(
     Ok((hasher.squeeze_hex(target_char_len), bytes_hashed))
 }
 
-/// Hashes a file using a 64 KB zeroizing stack buffer fed in `profile.rate_bytes()` sponge chunks (Fix 3.3).
-/// Returns `(hex_digest, actual_bytes_hashed)`.
 pub fn get_internal_tools_xof<P: AsRef<Path>>(
     profile: Profile,
     file_path: P,
@@ -937,11 +883,6 @@ fn run_hash(
     get_internal_tools_xof(profile, file_path, char_len)
 }
 
-// ========================================================================
-//  5. Hardened Iterative Directory Traversal & Merkle Tree
-// ========================================================================
-/// Encodes path components unambiguously without normalizing separators or losing non-UTF-8 bytes:
-/// `[component_count: u64 LE] ([component_len: u64 LE][raw_os_str_bytes])*`
 fn encode_path_components(path: &Path, out: &mut Vec<u8>) {
     let components: Vec<_> = path.components().collect();
     let mut len_buf = ZeroizingBuf::<8>::new();
@@ -1155,7 +1096,6 @@ fn list_pinned_dir_names(dir_file: &File, fallback_path: &Path) -> io::Result<Ve
         }
     }
 
-    // Fallback when /dev/fd is unavailable (e.g. minimal chroot): verify path inode matches pinned FD.
     let fd_meta = dir_file.metadata()?;
     let path_meta = fs::symlink_metadata(fallback_path)?;
     if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
@@ -1221,7 +1161,6 @@ fn collect_directory_entries(
                 let mut sorted_names = list_pinned_dir_names(&dir_file, &display_path)?;
                 sorted_names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
 
-                // Push in reverse order so LIFO pop preserves deterministic lexicographical DFS order.
                 for entry_name in sorted_names.into_iter().rev() {
                     let rel_path = if rel_dir.as_os_str().is_empty() {
                         PathBuf::from(&entry_name)
@@ -1290,7 +1229,6 @@ fn collect_directory_entries(
 
                 if file_kind == libc::S_IFLNK {
                     stats.symlink_count += 1;
-                    // Propagate symlink read errors immediately instead of hashing synthetic error strings (Fix 2.3).
                     let target = read_link_at(parent_dir.as_raw_fd(), &c_name)?;
                     let target_bytes = target.as_encoded_bytes();
 
@@ -1488,7 +1426,6 @@ fn collect_directory_entries(
                         .cmp(b.file_name().as_encoded_bytes())
                 });
 
-                // Push in reverse order so LIFO pop preserves deterministic lexicographical DFS order.
                 for entry in sorted_entries.into_iter().rev() {
                     stack.push(WorkItem::Entry { entry, depth });
                 }
@@ -1503,7 +1440,6 @@ fn collect_directory_entries(
 
                 if file_type.is_symlink() {
                     stats.symlink_count += 1;
-                    // Propagate fs::read_link errors immediately (Fix 2.3).
                     let target = fs::read_link(&path)?;
                     let target_bytes = target.as_os_str().as_encoded_bytes();
 
@@ -1627,8 +1563,6 @@ fn compute_merkle_root(
         );
     }
 
-    // Step 1 (Fix 1.3): Domain-hash every initial input entry with `LEAF:<entry_hash>`
-    // under `OBJ_DOMAIN_MERKLE_LEAF` (0x01) before pairwise tree reduction.
     let mut current_level: Vec<ZeroizingString> = hashes
         .into_iter()
         .map(|entry_hash| {
@@ -1642,7 +1576,6 @@ fn compute_merkle_root(
         })
         .collect();
 
-    // Always domain-separate 1-entry directories with NODE_ODD: + ROOT_FINAL:<leaf_count>:<root>
     if current_level.len() == 1 {
         let single = current_level.remove(0);
         let single_combined = ZeroizingString::new(format!("NODE_ODD:{}", single.as_str()));
@@ -1687,7 +1620,6 @@ fn compute_merkle_root(
         current_level = next_level;
     }
 
-    // Step 2 (Fix 1.3): Include total leaf count in final root digest under `OBJ_DOMAIN_DIR_ROOT` (0x03).
     let root = current_level.remove(0);
     let root_payload = ZeroizingString::new(format!("ROOT_FINAL:{}:{}", leaf_count, root.as_str()));
     hash_domain_bytes_xof(
@@ -1698,9 +1630,6 @@ fn compute_merkle_root(
     )
 }
 
-// ========================================================================
-//  6. Strict CLI Parser & Verification
-// ========================================================================
 fn is_valid_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1791,7 +1720,6 @@ fn main() {
         return;
     }
 
-    // Default to Paranoid profile; Standard is opt-in
     let mut mode: &str = "paranoid";
     let mut folder_mode = false;
     let mut merkle_mode = false;
@@ -1905,7 +1833,6 @@ fn main() {
     let char_len: usize;
 
     if check_mode {
-        // Strict positional order: <path> <expected_hash>
         if positional.len() != 2 {
             eprintln!(
                 "{}Error: /check requires exact positional arguments: <path> <expected_hash>{}",
@@ -1943,8 +1870,6 @@ fn main() {
             std::process::exit(1);
         }
 
-        // Fix 2.1: Require explicit /len:<N> for non-default lengths; otherwise default
-        // strictly to the canonical 128-char (512-bit) digest length.
         let required_len = explicit_len.unwrap_or(INTERNAL_HASH_HEX_LEN);
         if expected_str.len() != required_len {
             if explicit_len.is_some() {
@@ -1981,7 +1906,6 @@ fn main() {
             std::process::exit(1);
         }
 
-        // First positional argument is always <path>, even if numeric (e.g., "12345" or "2026").
         target_path = PathBuf::from(&positional[0]);
         expected_hash = None;
 
