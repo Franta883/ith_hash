@@ -1,18 +1,43 @@
-#![deny(unsafe_code)]
+//! ITH-XOF Cryptographic Hash Engine (Hardened 3D Sponge)
+//!
+//! # Scoped `unsafe` Boundary Documentation
+//! Crate-wide `#![deny(unsafe_code)]` has been replaced with function-scoped
+//! `#[allow(unsafe_code)]` blocks restricted strictly to two audited boundaries:
+//! 1. **Volatile Memory Zeroization (`core::ptr::write_volatile`)**:
+//!    Used in `volatile_zero_u64_grid`, `volatile_zero_u64_slice`, `volatile_zero_bytes`,
+//!    `volatile_zero_vec_capacity`, `absorb_rate_block`, and `extract_rate_block`
+//!    (followed by `compiler_fence(Ordering::SeqCst)`) to guarantee stack temporaries
+//!    and full heap capacities (`0..vec.capacity()`) are scrubbed before deallocation.
+//! 2. **Filesystem TOCTOU Pinning (`openat` / `fstatat` / `readlinkat` & `GetFileInformationByHandle`)**:
+//!    Used on Unix to anchor directory traversal and file access to opened directory file
+//!    descriptors with `O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC` and `AT_SYMLINK_NOFOLLOW`,
+//!    and on Windows to verify `FILE_FLAG_OPEN_REPARSE_POINT` handles via `GetFileInformationByHandle`.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use core::fmt;
 use core::hint::black_box;
+use core::ops::Deref;
 use core::sync::atomic::{compiler_fence, Ordering};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 
-const INTERNAL_HASH_HEX_LEN: usize = 128; // 512-bit internal security bound for Merkle nodes
-const MIN_CHECK_HEX_LEN: usize = 64; // 256-bit minimum digest length in /check mode
+const INTERNAL_HASH_HEX_LEN: usize = 128; // 512-bit canonical default & internal Merkle bound
+const MIN_CHECK_HEX_LEN: usize = 64; // 256-bit minimum digest length across generation & /check
 const MAX_OUTPUT_HEX_LEN: usize = 1_048_576; // 1 MiB hex char DoS cap
 const READ_BUF_SIZE: usize = 65_536; // 64 KB zeroizing stack read buffer
 const DEFAULT_MAX_DEPTH: usize = 64; // Default directory traversal depth limit
+
+// Mandatory 1-byte sponge object-type domain prefixes (Fix 1.2)
+pub const OBJ_DOMAIN_FILE_DATA: u8 = 0x00; // Raw single-file stream (FILE_DATA)
+pub const OBJ_DOMAIN_MERKLE_LEAF: u8 = 0x01; // Merkle leaf record (MERKLE_LEAF)
+pub const OBJ_DOMAIN_MERKLE_NODE: u8 = 0x02; // Merkle internal node (MERKLE_NODE)
+pub const OBJ_DOMAIN_DIR_ROOT: u8 = 0x03; // Directory manifest / root (DIR_ROOT)
 
 // Standard Profile (Opt-in): c = 1024 bits (16 lanes), r = 576 bits (9 lanes / 72 bytes)
 const STANDARD_RATE_WORDS: usize = 9;
@@ -50,7 +75,222 @@ const KECCAK_RHO: [[u32; 5]; 5] = [
 ];
 
 // ========================================================================
-//  1. Audited Side-Channel Hygiene & Volatile Memory Zeroization
+//  0. Scoped Platform FFI Declarations for TOCTOU Pinning
+// ========================================================================
+#[cfg(unix)]
+#[allow(non_camel_case_types, dead_code)]
+mod libc {
+    pub type c_int = std::os::raw::c_int;
+    pub type c_char = std::os::raw::c_char;
+
+    pub const O_RDONLY: c_int = 0;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_NONBLOCK: c_int = 0o4000;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "arm", target_arch = "aarch64")
+    ))]
+    pub const O_DIRECTORY: c_int = 0o40000;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "arm", target_arch = "aarch64"))
+    ))]
+    pub const O_DIRECTORY: c_int = 0o200000;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(target_arch = "arm", target_arch = "aarch64")
+    ))]
+    pub const O_NOFOLLOW: c_int = 0o100000;
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(target_arch = "arm", target_arch = "aarch64"))
+    ))]
+    pub const O_NOFOLLOW: c_int = 0o400000;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_CLOEXEC: c_int = 0o2000000;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const AT_FDCWD: c_int = -100;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
+
+    #[cfg(target_os = "macos")]
+    pub const O_NONBLOCK: c_int = 0x0004;
+    #[cfg(target_os = "macos")]
+    pub const O_NOFOLLOW: c_int = 0x0100;
+    #[cfg(target_os = "macos")]
+    pub const O_DIRECTORY: c_int = 0x100000;
+    #[cfg(target_os = "macos")]
+    pub const O_CLOEXEC: c_int = 0x01000000;
+    #[cfg(target_os = "macos")]
+    pub const AT_FDCWD: c_int = -2;
+    #[cfg(target_os = "macos")]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x0020;
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const O_NONBLOCK: c_int = 0x0004;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const O_NOFOLLOW: c_int = 0x0100;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const O_DIRECTORY: c_int = 0x00020000;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const O_CLOEXEC: c_int = 0x00100000;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const AT_FDCWD: c_int = -100;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x0200;
+
+    pub const S_IFMT: u32 = 0o170000;
+    pub const S_IFIFO: u32 = 0o010000;
+    pub const S_IFCHR: u32 = 0o020000;
+    pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFBLK: u32 = 0o060000;
+    pub const S_IFREG: u32 = 0o100000;
+    pub const S_IFLNK: u32 = 0o120000;
+    pub const S_IFSOCK: u32 = 0o140000;
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "x86_64"))]
+    #[repr(C)]
+    pub struct stat {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_nlink: u64,
+        pub st_mode: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub __pad0: i32,
+        pub st_rdev: u64,
+        pub st_size: i64,
+        pub st_blksize: i64,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused: [i64; 3],
+    }
+
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "x86_64")
+    ))]
+    #[repr(C)]
+    pub struct stat {
+        pub st_dev: u64,
+        pub st_ino: u64,
+        pub st_mode: u32,
+        pub st_nlink: u32,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: u64,
+        pub __pad1: u64,
+        pub st_size: i64,
+        pub st_blksize: i32,
+        pub __pad2: i32,
+        pub st_blocks: i64,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub __unused4: u32,
+        pub __unused5: u32,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub struct stat {
+        pub st_dev: i32,
+        pub st_mode: u16,
+        pub st_nlink: u16,
+        pub st_ino: u64,
+        pub st_uid: u32,
+        pub st_gid: u32,
+        pub st_rdev: i32,
+        pub st_atime: i64,
+        pub st_atime_nsec: i64,
+        pub st_mtime: i64,
+        pub st_mtime_nsec: i64,
+        pub st_ctime: i64,
+        pub st_ctime_nsec: i64,
+        pub st_birthtime: i64,
+        pub st_birthtime_nsec: i64,
+        pub st_size: i64,
+        pub st_blocks: i64,
+        pub st_blksize: i32,
+        pub st_flags: u32,
+        pub st_gen: u32,
+        pub st_lspare: i32,
+        pub st_qspare: [i64; 2],
+    }
+
+    extern "C" {
+        pub fn openat(dirfd: c_int, pathname: *const c_char, flags: c_int, ...) -> c_int;
+        pub fn readlinkat(
+            dirfd: c_int,
+            pathname: *const c_char,
+            buf: *mut c_char,
+            bufsiz: usize,
+        ) -> isize;
+        pub fn dup(oldfd: c_int) -> c_int;
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fstatat$INODE64"
+        )]
+        pub fn fstatat(
+            dirfd: c_int,
+            pathname: *const c_char,
+            buf: *mut stat,
+            flags: c_int,
+        ) -> c_int;
+    }
+}
+
+#[cfg(windows)]
+mod win_ffi {
+    pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct FILETIME {
+        pub dw_low_date_time: u32,
+        pub dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct BY_HANDLE_FILE_INFORMATION {
+        pub dw_file_attributes: u32,
+        pub ft_creation_time: FILETIME,
+        pub ft_last_access_time: FILETIME,
+        pub ft_last_write_time: FILETIME,
+        pub dw_volume_serial_number: u32,
+        pub n_file_size_high: u32,
+        pub n_file_size_low: u32,
+        pub n_number_of_links: u32,
+        pub n_file_index_high: u32,
+        pub n_file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetFileInformationByHandle(
+            h_file: *mut core::ffi::c_void,
+            lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+}
+
+// ========================================================================
+//  1. Audited Side-Channel Hygiene, Sanitization & Volatile Zeroization
 // ========================================================================
 #[allow(unsafe_code)]
 fn volatile_zero_u64_grid(grid: &mut [[u64; 5]; 5]) {
@@ -84,6 +324,18 @@ fn volatile_zero_bytes(buf: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
+#[allow(unsafe_code)]
+fn volatile_zero_vec_capacity(vec: &mut Vec<u8>) {
+    let cap = vec.capacity();
+    let ptr = vec.as_mut_ptr();
+    for i in 0..cap {
+        unsafe {
+            core::ptr::write_volatile(ptr.add(i), 0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Stack-allocated buffer that guarantees volatile zeroization on drop (including early `?` returns).
 struct ZeroizingBuf<const N: usize>([u8; N]);
 
@@ -99,13 +351,85 @@ impl<const N: usize> Drop for ZeroizingBuf<N> {
     }
 }
 
-/// Heap-allocated byte vector that guarantees volatile zeroization on drop.
-struct ZeroizingVec(Vec<u8>);
+/// Heap-allocated byte vector that guarantees volatile zeroization across its full capacity on drop.
+pub struct ZeroizingVec(pub Vec<u8>);
+
+impl ZeroizingVec {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+}
 
 impl Drop for ZeroizingVec {
     fn drop(&mut self) {
-        volatile_zero_bytes(&mut self.0);
+        volatile_zero_vec_capacity(&mut self.0);
     }
+}
+
+/// Heap-allocated string that guarantees volatile zeroization across its full capacity on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ZeroizingString(String);
+
+impl ZeroizingString {
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Deref for ZeroizingString {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<str> for ZeroizingString {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl AsRef<[u8]> for ZeroizingString {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Display for ZeroizingString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+impl fmt::Debug for ZeroizingString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl Drop for ZeroizingString {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        let vec = unsafe { self.0.as_mut_vec() };
+        volatile_zero_vec_capacity(vec);
+    }
+}
+
+/// Branchless constant-time nibble-to-lowercase-hex conversion (Fix 3.1).
+#[inline]
+fn nibble_to_hex(n: u8) -> u8 {
+    let n = n & 0x0f;
+    let mask = ((9u8.wrapping_sub(n)) >> 7).wrapping_neg();
+    n + b'0' + (mask & 39)
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -117,6 +441,26 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff = black_box(diff | black_box(x ^ y));
     }
     black_box(diff) == 0
+}
+
+/// Escapes C0 (`0x00..=0x1F`) and C1 (`0x7F..=0x9F`) control characters as `\xNN`
+/// to prevent terminal ANSI escape sequence injection / line spoofing (Fix 2.2).
+pub fn sanitize_display(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let code = ch as u32;
+        if (0x00..=0x1F).contains(&code) || (0x7F..=0x9F).contains(&code) {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "\\x{:02x}", code);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn sanitize_path_display(path: &Path) -> String {
+    sanitize_display(&path.to_string_lossy())
 }
 
 // ========================================================================
@@ -163,18 +507,23 @@ fn permute_state(state: &mut [[u64; 5]; 5]) {
 // ========================================================================
 //  3. Stateful Sponge Engine with Strict Capacity Isolation & Phase Lock
 // ========================================================================
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Paranoid,
     Standard,
 }
 
 impl Profile {
-    pub fn from_str(mode: &str) -> Self {
+    pub fn from_str(mode: &str) -> Result<Self, String> {
         if mode.eq_ignore_ascii_case("standard") {
-            Profile::Standard
+            Ok(Profile::Standard)
+        } else if mode.eq_ignore_ascii_case("paranoid") {
+            Ok(Profile::Paranoid)
         } else {
-            Profile::Paranoid
+            Err(format!(
+                "unknown profile '{}' (expected 'paranoid' or 'standard')",
+                sanitize_display(mode)
+            ))
         }
     }
 
@@ -203,6 +552,22 @@ impl Profile {
     }
 }
 
+pub fn validate_output_hex_len(target_char_len: usize) -> Result<(), String> {
+    if !(MIN_CHECK_HEX_LEN..=MAX_OUTPUT_HEX_LEN).contains(&target_char_len) {
+        return Err(format!(
+            "Requested output length {} must be between {} and {} hex characters",
+            target_char_len, MIN_CHECK_HEX_LEN, MAX_OUTPUT_HEX_LEN
+        ));
+    }
+    if target_char_len % 2 != 0 {
+        return Err(format!(
+            "Requested output length {} must be an even number of hex characters",
+            target_char_len
+        ));
+    }
+    Ok(())
+}
+
 pub struct IthHasher {
     state: [[u64; 5]; 5],
     buffer: [u8; STANDARD_BLOCK],
@@ -215,11 +580,19 @@ pub struct IthHasher {
 }
 
 impl IthHasher {
+    /// Creates a sponge pre-initialized with the mandatory 1-byte `OBJ_DOMAIN_FILE_DATA` (`0x00`) prefix.
     pub fn new(profile: Profile) -> Self {
+        Self::new_with_domain(profile, OBJ_DOMAIN_FILE_DATA)
+    }
+
+    /// Creates a sponge pre-initialized with a mandatory 1-byte object-type domain tag (Fix 1.2).
+    pub fn new_with_domain(profile: Profile, obj_domain: u8) -> Self {
+        let mut buffer = [0u8; STANDARD_BLOCK];
+        buffer[0] = obj_domain;
         Self {
             state: [[0u64; 5]; 5],
-            buffer: [0u8; STANDARD_BLOCK],
-            buf_len: 0,
+            buffer,
+            buf_len: 1,
             squeeze_offset: 0,
             rate_words: profile.rate_words(),
             rate_bytes: profile.rate_bytes(),
@@ -229,32 +602,46 @@ impl IthHasher {
     }
 
     #[inline]
+    #[allow(unsafe_code)]
     fn absorb_rate_block(&mut self, block: &[u8]) {
         // Strict capacity isolation: only touch the first `rate_words` lanes
         // mapped via x = i % 5, y = i / 5
         let mut word_bytes = ZeroizingBuf::<8>::new();
+        let mut lane_val: u64 = 0;
         for i in 0..self.rate_words {
             let start = i * 8;
             word_bytes.0.copy_from_slice(&block[start..start + 8]);
+            lane_val = u64::from_le_bytes(word_bytes.0);
             let x = i % 5;
             let y = i / 5;
-            self.state[x][y] ^= u64::from_le_bytes(word_bytes.0);
+            self.state[x][y] ^= lane_val;
         }
+        unsafe {
+            core::ptr::write_volatile(&mut lane_val, 0);
+        }
+        compiler_fence(Ordering::SeqCst);
         drop(word_bytes);
         permute_state(&mut self.state);
     }
 
     #[inline]
+    #[allow(unsafe_code)]
     fn extract_rate_block(&mut self) {
         // Strict capacity isolation: read only from the first `rate_words` lanes
-        let mut word_bytes = ZeroizingBuf::<8>::new();
+        let mut lane_val: u64 = 0;
         for i in 0..self.rate_words {
             let x = i % 5;
             let y = i / 5;
-            word_bytes.0 = self.state[x][y].to_le_bytes();
+            lane_val = self.state[x][y];
             let start = i * 8;
-            self.buffer[start..start + 8].copy_from_slice(&word_bytes.0);
+            for b_idx in 0..8 {
+                self.buffer[start + b_idx] = ((lane_val >> (b_idx * 8)) & 0xff) as u8;
+            }
         }
+        unsafe {
+            core::ptr::write_volatile(&mut lane_val, 0);
+        }
+        compiler_fence(Ordering::SeqCst);
         self.squeeze_offset = 0;
     }
 
@@ -335,30 +722,25 @@ impl IthHasher {
         }
     }
 
-    pub fn squeeze_hex(&mut self, target_char_len: usize) -> String {
-        assert!(
-            target_char_len <= MAX_OUTPUT_HEX_LEN,
-            "Requested output length {} exceeds maximum allowed ({} hex chars)",
-            target_char_len,
-            MAX_OUTPUT_HEX_LEN
-        );
+    pub fn squeeze_hex(&mut self, target_char_len: usize) -> ZeroizingString {
+        if let Err(msg) = validate_output_hex_len(target_char_len) {
+            panic!("{}", msg);
+        }
 
-        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-        let target_byte_len = (target_char_len + 1) / 2;
+        let target_byte_len = target_char_len / 2;
         let mut output_bytes = ZeroizingVec(vec![0u8; target_byte_len]);
         self.squeeze(&mut output_bytes.0);
 
         let mut hex_bytes = Vec::with_capacity(target_char_len);
         for &byte in &output_bytes.0 {
-            hex_bytes.push(HEX_CHARS[(byte >> 4) as usize]);
-            if hex_bytes.len() < target_char_len {
-                hex_bytes.push(HEX_CHARS[(byte & 0x0f) as usize]);
-            }
+            hex_bytes.push(nibble_to_hex(byte >> 4));
+            hex_bytes.push(nibble_to_hex(byte & 0x0f));
         }
         drop(output_bytes);
 
-        String::from_utf8(hex_bytes).expect("HEX_CHARS produces valid ASCII UTF-8")
+        ZeroizingString::new(
+            String::from_utf8(hex_bytes).expect("nibble_to_hex produces valid ASCII UTF-8"),
+        )
     }
 }
 
@@ -370,12 +752,32 @@ impl Drop for IthHasher {
 }
 
 // ========================================================================
-//  4. High-Level Byte & File XOF Helpers
+//  4. High-Level Byte & File XOF Helpers (TOCTOU-Hardened)
 // ========================================================================
-pub fn hash_bytes_xof(mode: &str, payload_bytes: &[u8], char_len: usize) -> String {
-    let mut hasher = IthHasher::new(Profile::from_str(mode));
+pub fn hash_domain_bytes_xof(
+    profile: Profile,
+    obj_domain: u8,
+    payload_bytes: &[u8],
+    char_len: usize,
+) -> ZeroizingString {
+    let mut hasher = IthHasher::new_with_domain(profile, obj_domain);
     hasher.absorb(payload_bytes);
     hasher.squeeze_hex(char_len)
+}
+
+pub fn hash_bytes_xof(
+    mode: &str,
+    payload_bytes: &[u8],
+    char_len: usize,
+) -> Result<ZeroizingString, String> {
+    let profile = Profile::from_str(mode)?;
+    validate_output_hex_len(char_len)?;
+    Ok(hash_domain_bytes_xof(
+        profile,
+        OBJ_DOMAIN_FILE_DATA,
+        payload_bytes,
+        char_len,
+    ))
 }
 
 fn read_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -391,47 +793,116 @@ fn read_full<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usi
     Ok(total_read)
 }
 
-/// Hashes a file using a 64 KB zeroizing stack buffer fed in `BLOCK_SIZE_BYTES` sponge chunks.
-/// Returns `(hex_digest, actual_bytes_hashed)`.
-pub fn get_internal_tools_xof<
-    const RATE_WORDS: usize,
-    const BLOCK_SIZE_BYTES: usize,
-    P: AsRef<Path>,
->(
-    file_path: P,
-    target_char_len: usize,
-) -> io::Result<(String, u64)> {
-    if target_char_len > MAX_OUTPUT_HEX_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "Requested output length {} exceeds maximum allowed ({} hex chars)",
-                target_char_len, MAX_OUTPUT_HEX_LEN
-            ),
-        ));
+/// Opens a regular file without following symlinks and verifies its descriptor/handle metadata (Fix 2.4).
+fn open_regular_file_no_follow(path: &Path) -> io::Result<(File, fs::Metadata)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target descriptor is not a regular file",
+            ));
+        }
+        Ok((file, meta))
     }
 
-    let profile = if RATE_WORDS == STANDARD_RATE_WORDS {
-        Profile::Standard
-    } else {
-        Profile::Paranoid
-    };
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
 
-    let mut hasher = IthHasher::new(profile);
-    let mut file = File::open(file_path)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(win_ffi::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+
+        let mut info = win_ffi::BY_HANDLE_FILE_INFORMATION::default();
+        let ok = unsafe {
+            win_ffi::GetFileInformationByHandle(
+                file.as_raw_handle() as *mut core::ffi::c_void,
+                &mut info,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (info.dw_file_attributes & win_ffi::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Refusing to follow reparse point / symlink",
+            ));
+        }
+        if (info.dw_file_attributes & win_ffi::FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target handle is a directory, not a regular file",
+            ));
+        }
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target handle is not a regular file",
+            ));
+        }
+        Ok((file, meta))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let sym_meta = fs::symlink_metadata(path)?;
+        if !sym_meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target is not a regular file",
+            ));
+        }
+        let file = File::open(path)?;
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target descriptor is not a regular file",
+            ));
+        }
+        Ok((file, meta))
+    }
+}
+
+/// Hashes an already-opened and verified file descriptor using a 64 KB zeroizing stack buffer.
+fn hash_open_file_xof(
+    profile: Profile,
+    file: &mut File,
+    target_char_len: usize,
+) -> io::Result<(ZeroizingString, u64)> {
+    validate_output_hex_len(target_char_len)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+
+    let block_size_bytes = profile.rate_bytes();
+    let mut hasher = IthHasher::new_with_domain(profile, OBJ_DOMAIN_FILE_DATA);
     let mut read_buf = ZeroizingBuf::<READ_BUF_SIZE>::new();
     let mut bytes_hashed: u64 = 0;
 
     loop {
-        let bytes_read = read_full(&mut file, &mut read_buf.0)?;
+        let bytes_read = read_full(file, &mut read_buf.0)?;
         if bytes_read == 0 {
             break;
         }
         bytes_hashed = bytes_hashed.checked_add(bytes_read as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "Hashed byte counter overflowed u64")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hashed byte counter overflowed u64",
+            )
         })?;
 
-        for chunk in read_buf.0[..bytes_read].chunks(BLOCK_SIZE_BYTES) {
+        for chunk in read_buf.0[..bytes_read].chunks(block_size_bytes) {
             hasher.absorb(chunk);
         }
 
@@ -444,12 +915,26 @@ pub fn get_internal_tools_xof<
     Ok((hasher.squeeze_hex(target_char_len), bytes_hashed))
 }
 
-fn run_hash(mode: &str, file_path: &Path, char_len: usize) -> io::Result<(String, u64)> {
-    if Profile::from_str(mode) == Profile::Standard {
-        get_internal_tools_xof::<STANDARD_RATE_WORDS, STANDARD_BLOCK, _>(file_path, char_len)
-    } else {
-        get_internal_tools_xof::<PARANOID_RATE_WORDS, PARANOID_BLOCK, _>(file_path, char_len)
-    }
+/// Hashes a file using a 64 KB zeroizing stack buffer fed in `profile.rate_bytes()` sponge chunks (Fix 3.3).
+/// Returns `(hex_digest, actual_bytes_hashed)`.
+pub fn get_internal_tools_xof<P: AsRef<Path>>(
+    profile: Profile,
+    file_path: P,
+    target_char_len: usize,
+) -> io::Result<(ZeroizingString, u64)> {
+    validate_output_hex_len(target_char_len)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))?;
+
+    let (mut file, _meta) = open_regular_file_no_follow(file_path.as_ref())?;
+    hash_open_file_xof(profile, &mut file, target_char_len)
+}
+
+fn run_hash(
+    profile: Profile,
+    file_path: &Path,
+    char_len: usize,
+) -> io::Result<(ZeroizingString, u64)> {
+    get_internal_tools_xof(profile, file_path, char_len)
 }
 
 // ========================================================================
@@ -459,15 +944,20 @@ fn run_hash(mode: &str, file_path: &Path, char_len: usize) -> io::Result<(String
 /// `[component_count: u64 LE] ([component_len: u64 LE][raw_os_str_bytes])*`
 fn encode_path_components(path: &Path, out: &mut Vec<u8>) {
     let components: Vec<_> = path.components().collect();
-    out.extend_from_slice(&(components.len() as u64).to_le_bytes());
+    let mut len_buf = ZeroizingBuf::<8>::new();
+    len_buf.0 = (components.len() as u64).to_le_bytes();
+    out.extend_from_slice(&len_buf.0);
     for comp in components {
         let bytes = comp.as_os_str().as_encoded_bytes();
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        len_buf.0 = (bytes.len() as u64).to_le_bytes();
+        out.extend_from_slice(&len_buf.0);
         out.extend_from_slice(bytes);
     }
 }
 
-fn special_file_type_label(_ft: &fs::FileType) -> &'static str {
+fn special_file_type_label(
+    #[cfg_attr(not(unix), allow(unused_variables))] ft: &fs::FileType,
+) -> &'static str {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -487,6 +977,49 @@ fn special_file_type_label(_ft: &fs::FileType) -> &'static str {
     "other"
 }
 
+#[cfg(unix)]
+fn special_mode_type_label(st_mode: u32) -> &'static str {
+    match st_mode & libc::S_IFMT {
+        libc::S_IFIFO => "fifo",
+        libc::S_IFSOCK => "socket",
+        libc::S_IFBLK => "block_device",
+        libc::S_IFCHR => "char_device",
+        _ => "other",
+    }
+}
+
+fn metadata_mode_or_attributes(meta: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        0u32
+    }
+}
+
+fn metadata_special_rdev(
+    #[cfg_attr(not(unix), allow(unused_variables))] meta: &fs::Metadata,
+    #[cfg_attr(not(unix), allow(unused_variables))] ft: &fs::FileType,
+) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if ft.is_block_device() || ft.is_char_device() {
+            return Some(meta.rdev());
+        }
+    }
+    None
+}
+
 struct DirStats {
     file_count: usize,
     dir_count: usize,
@@ -495,17 +1028,444 @@ struct DirStats {
     total_size: u64,
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_dir_at(dir_fd: libc::c_int, path_os: & std::ffi::OsStr) -> io::Result<(File, fs::Metadata)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    let c_path = CString::new(path_os.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path contains interior NUL byte",
+        )
+    })?;
+
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Opened descriptor is not a directory",
+        ));
+    }
+    Ok((file, meta))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_regular_file_at(
+    dir_fd: libc::c_int,
+    name_c: &std::ffi::CStr,
+    expected_dev: u64,
+    expected_ino: u64,
+) -> io::Result<(File, fs::Metadata)> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Opened entry descriptor is not a regular file",
+        ));
+    }
+    if meta.dev() != expected_dev || meta.ino() != expected_ino {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TOCTOU race detected: file inode/device changed between fstatat and openat",
+        ));
+    }
+    Ok((file, meta))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_link_at(dir_fd: libc::c_int, name_c: &std::ffi::CStr) -> io::Result<OsString> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buf_size: usize = 256;
+    loop {
+        let mut buf = vec![0u8; buf_size];
+        let len = unsafe {
+            libc::readlinkat(
+                dir_fd,
+                name_c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = len as usize;
+        if len < buf.len() {
+            buf.truncate(len);
+            return Ok(OsString::from_vec(buf));
+        }
+        if buf_size >= 65_536 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Symlink target exceeds 64 KiB maximum length",
+            ));
+        }
+        buf_size *= 2;
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn list_pinned_dir_names(dir_file: &File, fallback_path: &Path) -> io::Result<Vec<OsString>> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let raw_fd = dir_file.as_raw_fd();
+    let dup_fd = unsafe { libc::dup(raw_fd) };
+    if dup_fd >= 0 {
+        let dup_file = unsafe { File::from_raw_fd(dup_fd) };
+        let fd_path = format!("/dev/fd/{}", dup_file.as_raw_fd());
+        if let Ok(rd) = fs::read_dir(&fd_path) {
+            let mut names = Vec::new();
+            for entry in rd {
+                names.push(entry?.file_name());
+            }
+            return Ok(names);
+        }
+    }
+
+    // Fallback when /dev/fd is unavailable (e.g. minimal chroot): verify path inode matches pinned FD.
+    let fd_meta = dir_file.metadata()?;
+    let path_meta = fs::symlink_metadata(fallback_path)?;
+    if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TOCTOU race detected: directory inode changed during traversal",
+        ));
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(fallback_path)? {
+        names.push(entry?.file_name());
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+enum UnixWorkItem {
+    Dir {
+        dir_file: Arc<File>,
+        rel_dir: PathBuf,
+        display_path: PathBuf,
+        depth: usize,
+    },
+    Entry {
+        parent_dir: Arc<File>,
+        entry_name: OsString,
+        rel_path: PathBuf,
+        display_path: PathBuf,
+        depth: usize,
+    },
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn collect_directory_entries(
+    root_dir: &Path,
+    profile: Profile,
+    max_depth: usize,
+    stats: &mut DirStats,
+    entries_out: &mut Vec<ZeroizingString>,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let (root_file, _root_meta) = open_dir_at(libc::AT_FDCWD, root_dir.as_os_str())?;
+    let mut stack = vec![UnixWorkItem::Dir {
+        dir_file: Arc::new(root_file),
+        rel_dir: PathBuf::new(),
+        display_path: root_dir.to_path_buf(),
+        depth: 0,
+    }];
+
+    while let Some(item) = stack.pop() {
+        match item {
+            UnixWorkItem::Dir {
+                dir_file,
+                rel_dir,
+                display_path,
+                depth,
+            } => {
+                let mut sorted_names = list_pinned_dir_names(&dir_file, &display_path)?;
+                sorted_names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
+
+                // Push in reverse order so LIFO pop preserves deterministic lexicographical DFS order.
+                for entry_name in sorted_names.into_iter().rev() {
+                    let rel_path = if rel_dir.as_os_str().is_empty() {
+                        PathBuf::from(&entry_name)
+                    } else {
+                        rel_dir.join(&entry_name)
+                    };
+                    let child_display = display_path.join(&entry_name);
+                    stack.push(UnixWorkItem::Entry {
+                        parent_dir: Arc::clone(&dir_file),
+                        entry_name,
+                        rel_path,
+                        display_path: child_display,
+                        depth,
+                    });
+                }
+            }
+            UnixWorkItem::Entry {
+                parent_dir,
+                entry_name,
+                rel_path,
+                display_path,
+                depth,
+            } => {
+                let c_name = CString::new(entry_name.as_bytes()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Directory entry contains interior NUL byte",
+                    )
+                })?;
+
+                #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+                let (st_mode, st_dev, st_ino, st_rdev) = {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    let rc = unsafe {
+                        libc::fstatat(
+                            parent_dir.as_raw_fd(),
+                            c_name.as_ptr(),
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    if rc < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    (
+                        st.st_mode as u32,
+                        st.st_dev as u64,
+                        st.st_ino as u64,
+                        st.st_rdev as u64,
+                    )
+                };
+
+                #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+                let (st_mode, st_dev, st_ino, st_rdev) = {
+                    let sym_meta = fs::symlink_metadata(&display_path)?;
+                    (
+                        sym_meta.mode(),
+                        sym_meta.dev(),
+                        sym_meta.ino(),
+                        sym_meta.rdev(),
+                    )
+                };
+
+                let file_kind = st_mode & libc::S_IFMT;
+                let mut record = ZeroizingVec::with_capacity(256);
+
+                if file_kind == libc::S_IFLNK {
+                    stats.symlink_count += 1;
+                    // Propagate symlink read errors immediately instead of hashing synthetic error strings (Fix 2.3).
+                    let target = read_link_at(parent_dir.as_raw_fd(), &c_name)?;
+                    let target_bytes = target.as_encoded_bytes();
+
+                    record.0.extend_from_slice(b"SYMLINK:");
+                    encode_path_components(&rel_path, &mut record.0);
+                    record.0.extend_from_slice(b"TARGET:");
+                    record
+                        .0
+                        .extend_from_slice(&(target_bytes.len() as u64).to_le_bytes());
+                    record.0.extend_from_slice(target_bytes);
+
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
+                } else if file_kind == libc::S_IFDIR {
+                    stats.dir_count += 1;
+                    let (child_dir, child_meta) =
+                        open_dir_at(parent_dir.as_raw_fd(), entry_name.as_os_str())?;
+                    if child_meta.dev() != st_dev || child_meta.ino() != st_ino {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "TOCTOU race detected: subdirectory inode/device changed between fstatat and openat",
+                        ));
+                    }
+
+                    let mode_bits = metadata_mode_or_attributes(&child_meta);
+                    record.0.extend_from_slice(b"DIR:");
+                    encode_path_components(&rel_path, &mut record.0);
+                    record.0.extend_from_slice(&mode_bits.to_le_bytes());
+
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
+
+                    if depth >= max_depth {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Maximum directory traversal depth ({}) exceeded at '{}'",
+                                max_depth,
+                                sanitize_path_display(&display_path)
+                            ),
+                        ));
+                    }
+
+                    stack.push(UnixWorkItem::Dir {
+                        dir_file: Arc::new(child_dir),
+                        rel_dir: rel_path,
+                        display_path,
+                        depth: depth + 1,
+                    });
+                } else if file_kind == libc::S_IFREG {
+                    stats.file_count += 1;
+                    let (mut child_file, child_meta) =
+                        open_regular_file_at(parent_dir.as_raw_fd(), &c_name, st_dev, st_ino)?;
+                    let (content_hash, bytes_hashed) =
+                        hash_open_file_xof(profile, &mut child_file, INTERNAL_HASH_HEX_LEN)?;
+
+                    stats.total_size =
+                        stats.total_size.checked_add(bytes_hashed).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "Total size overflowed u64")
+                        })?;
+
+                    let mode_bits = metadata_mode_or_attributes(&child_meta);
+                    record.0.extend_from_slice(b"FILE:");
+                    encode_path_components(&rel_path, &mut record.0);
+                    record.0.extend_from_slice(&mode_bits.to_le_bytes());
+                    record.0.extend_from_slice(&bytes_hashed.to_le_bytes());
+                    record.0.extend_from_slice(content_hash.as_bytes());
+
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
+                } else {
+                    stats.special_count += 1;
+                    let kind_label = if let Ok(sym_meta) = fs::symlink_metadata(&display_path) {
+                        special_file_type_label(&sym_meta.file_type())
+                    } else {
+                        special_mode_type_label(st_mode)
+                    };
+
+                    eprintln!(
+                        "{}Warning: special file ({}) encountered at '{}'{}",
+                        COLOR_YELLOW,
+                        kind_label,
+                        sanitize_path_display(&display_path),
+                        COLOR_RESET
+                    );
+
+                    record.0.extend_from_slice(b"SPECIAL:");
+                    encode_path_components(&rel_path, &mut record.0);
+                    record.0.extend_from_slice(&st_mode.to_le_bytes());
+                    record
+                        .0
+                        .extend_from_slice(&(kind_label.len() as u64).to_le_bytes());
+                    record.0.extend_from_slice(kind_label.as_bytes());
+                    if file_kind == libc::S_IFBLK || file_kind == libc::S_IFCHR {
+                        record.0.extend_from_slice(b"RDEV:");
+                        record.0.extend_from_slice(&st_rdev.to_le_bytes());
+                    }
+
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn open_pinned_dir_windows(path: &Path) -> io::Result<(File, u32)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let dir_handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            win_ffi::FILE_FLAG_OPEN_REPARSE_POINT | win_ffi::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(path)?;
+
+    let mut info = win_ffi::BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe {
+        win_ffi::GetFileInformationByHandle(
+            dir_handle.as_raw_handle() as *mut core::ffi::c_void,
+            &mut info,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (info.dw_file_attributes & win_ffi::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Refusing to traverse directory reparse point / symlink",
+        ));
+    }
+    if (info.dw_file_attributes & win_ffi::FILE_ATTRIBUTE_DIRECTORY) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Target handle is not a directory",
+        ));
+    }
+    Ok((dir_handle, info.dw_file_attributes))
+}
+
+#[cfg(not(unix))]
 enum WorkItem {
     Dir { path: PathBuf, depth: usize },
     Entry { entry: fs::DirEntry, depth: usize },
 }
 
+#[cfg(not(unix))]
 fn collect_directory_entries(
     root_dir: &Path,
-    mode: &str,
+    profile: Profile,
     max_depth: usize,
     stats: &mut DirStats,
-    entries_out: &mut Vec<String>,
+    entries_out: &mut Vec<ZeroizingString>,
 ) -> io::Result<()> {
     let mut stack = vec![WorkItem::Dir {
         path: root_dir.to_path_buf(),
@@ -515,6 +1475,9 @@ fn collect_directory_entries(
     while let Some(item) = stack.pop() {
         match item {
             WorkItem::Dir { path, depth } => {
+                #[cfg(windows)]
+                let _pinned_dir = open_pinned_dir_windows(&path)?;
+
                 let mut sorted_entries = Vec::new();
                 for entry in fs::read_dir(&path)? {
                     sorted_entries.push(entry?);
@@ -532,50 +1495,48 @@ fn collect_directory_entries(
             }
             WorkItem::Entry { entry, depth } => {
                 let path = entry.path();
-                let file_type = entry.file_type()?;
+                let sym_meta = fs::symlink_metadata(&path)?;
+                let file_type = sym_meta.file_type();
                 let rel_path = path.strip_prefix(root_dir).unwrap_or(&path);
 
-                let mut record = Vec::new();
+                let mut record = ZeroizingVec::with_capacity(256);
 
                 if file_type.is_symlink() {
                     stats.symlink_count += 1;
-                    record.extend_from_slice(b"SYMLINK:");
-                    encode_path_components(rel_path, &mut record);
+                    // Propagate fs::read_link errors immediately (Fix 2.3).
+                    let target = fs::read_link(&path)?;
+                    let target_bytes = target.as_os_str().as_encoded_bytes();
 
-                    match fs::read_link(&path) {
-                        Ok(target) => {
-                            let target_bytes = target.as_os_str().as_encoded_bytes();
-                            record.extend_from_slice(b"TARGET:");
-                            record.extend_from_slice(&(target_bytes.len() as u64).to_le_bytes());
-                            record.extend_from_slice(target_bytes);
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "{}Warning: unreadable symlink '{}': {}{}",
-                                COLOR_YELLOW,
-                                path.display(),
-                                err,
-                                COLOR_RESET
-                            );
-                            record.extend_from_slice(b"ERROR:");
-                            if let Some(errno) = err.raw_os_error() {
-                                record.extend_from_slice(b"ERRNO:");
-                                record.extend_from_slice(&errno.to_le_bytes());
-                            } else {
-                                let kind_str = format!("{:?}", err.kind());
-                                record.extend_from_slice(b"KIND:");
-                                record.extend_from_slice(&(kind_str.len() as u64).to_le_bytes());
-                                record.extend_from_slice(kind_str.as_bytes());
-                            }
-                        }
-                    }
+                    record.0.extend_from_slice(b"SYMLINK:");
+                    encode_path_components(rel_path, &mut record.0);
+                    record.0.extend_from_slice(b"TARGET:");
+                    record
+                        .0
+                        .extend_from_slice(&(target_bytes.len() as u64).to_le_bytes());
+                    record.0.extend_from_slice(target_bytes);
 
-                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
                 } else if file_type.is_dir() {
                     stats.dir_count += 1;
-                    record.extend_from_slice(b"DIR:");
-                    encode_path_components(rel_path, &mut record);
-                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                    #[cfg(windows)]
+                    let (_pinned_subdir, mode_bits) = open_pinned_dir_windows(&path)?;
+                    #[cfg(not(windows))]
+                    let mode_bits = metadata_mode_or_attributes(&sym_meta);
+
+                    record.0.extend_from_slice(b"DIR:");
+                    encode_path_components(rel_path, &mut record.0);
+                    record.0.extend_from_slice(&mode_bits.to_le_bytes());
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
 
                     if depth >= max_depth {
                         return Err(io::Error::new(
@@ -583,7 +1544,7 @@ fn collect_directory_entries(
                             format!(
                                 "Maximum directory traversal depth ({}) exceeded at '{}'",
                                 max_depth,
-                                path.display()
+                                sanitize_path_display(&path)
                             ),
                         ));
                     }
@@ -594,16 +1555,26 @@ fn collect_directory_entries(
                     });
                 } else if file_type.is_file() {
                     stats.file_count += 1;
-                    let (content_hash, bytes_hashed) = run_hash(mode, &path, INTERNAL_HASH_HEX_LEN)?;
-                    stats.total_size = stats.total_size.checked_add(bytes_hashed).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Total size overflowed u64")
-                    })?;
+                    let (mut file, file_meta) = open_regular_file_no_follow(&path)?;
+                    let (content_hash, bytes_hashed) =
+                        hash_open_file_xof(profile, &mut file, INTERNAL_HASH_HEX_LEN)?;
+                    stats.total_size =
+                        stats.total_size.checked_add(bytes_hashed).ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "Total size overflowed u64")
+                        })?;
 
-                    record.extend_from_slice(b"FILE:");
-                    encode_path_components(rel_path, &mut record);
-                    record.extend_from_slice(&bytes_hashed.to_le_bytes());
-                    record.extend_from_slice(content_hash.as_bytes());
-                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                    let mode_bits = metadata_mode_or_attributes(&file_meta);
+                    record.0.extend_from_slice(b"FILE:");
+                    encode_path_components(rel_path, &mut record.0);
+                    record.0.extend_from_slice(&mode_bits.to_le_bytes());
+                    record.0.extend_from_slice(&bytes_hashed.to_le_bytes());
+                    record.0.extend_from_slice(content_hash.as_bytes());
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
                 } else {
                     stats.special_count += 1;
                     let kind_label = special_file_type_label(&file_type);
@@ -611,15 +1582,28 @@ fn collect_directory_entries(
                         "{}Warning: special file ({}) encountered at '{}'{}",
                         COLOR_YELLOW,
                         kind_label,
-                        path.display(),
+                        sanitize_path_display(&path),
                         COLOR_RESET
                     );
 
-                    record.extend_from_slice(b"SPECIAL:");
-                    encode_path_components(rel_path, &mut record);
-                    record.extend_from_slice(&(kind_label.len() as u64).to_le_bytes());
-                    record.extend_from_slice(kind_label.as_bytes());
-                    entries_out.push(hash_bytes_xof(mode, &record, INTERNAL_HASH_HEX_LEN));
+                    let mode_bits = metadata_mode_or_attributes(&sym_meta);
+                    record.0.extend_from_slice(b"SPECIAL:");
+                    encode_path_components(rel_path, &mut record.0);
+                    record.0.extend_from_slice(&mode_bits.to_le_bytes());
+                    record
+                        .0
+                        .extend_from_slice(&(kind_label.len() as u64).to_le_bytes());
+                    record.0.extend_from_slice(kind_label.as_bytes());
+                    if let Some(rdev) = metadata_special_rdev(&sym_meta, &file_type) {
+                        record.0.extend_from_slice(b"RDEV:");
+                        record.0.extend_from_slice(&rdev.to_le_bytes());
+                    }
+                    entries_out.push(hash_domain_bytes_xof(
+                        profile,
+                        OBJ_DOMAIN_MERKLE_LEAF,
+                        &record.0,
+                        INTERNAL_HASH_HEX_LEN,
+                    ));
                 }
             }
         }
@@ -628,44 +1612,90 @@ fn collect_directory_entries(
     Ok(())
 }
 
-fn compute_merkle_root(mode: &str, mut hashes: Vec<String>, final_char_len: usize) -> String {
-    if hashes.is_empty() {
-        return hash_bytes_xof(mode, b"MERKLE_EMPTY_TREE", final_char_len);
+fn compute_merkle_root(
+    profile: Profile,
+    hashes: Vec<ZeroizingString>,
+    final_char_len: usize,
+) -> ZeroizingString {
+    let leaf_count = hashes.len();
+    if leaf_count == 0 {
+        return hash_domain_bytes_xof(
+            profile,
+            OBJ_DOMAIN_DIR_ROOT,
+            b"ROOT_FINAL:0:MERKLE_EMPTY_TREE",
+            final_char_len,
+        );
     }
 
-    // Always domain-separate 1-entry directories with NODE_ODD: + ROOT_FINAL:
-    if hashes.len() == 1 {
-        let single_combined = format!("NODE_ODD:{}", hashes.remove(0));
-        let single_node = hash_bytes_xof(mode, single_combined.as_bytes(), INTERNAL_HASH_HEX_LEN);
-        let root_payload = format!("ROOT_FINAL:{}", single_node);
-        return hash_bytes_xof(mode, root_payload.as_bytes(), final_char_len);
+    // Step 1 (Fix 1.3): Domain-hash every initial input entry with `LEAF:<entry_hash>`
+    // under `OBJ_DOMAIN_MERKLE_LEAF` (0x01) before pairwise tree reduction.
+    let mut current_level: Vec<ZeroizingString> = hashes
+        .into_iter()
+        .map(|entry_hash| {
+            let leaf_payload = ZeroizingString::new(format!("LEAF:{}", entry_hash.as_str()));
+            hash_domain_bytes_xof(
+                profile,
+                OBJ_DOMAIN_MERKLE_LEAF,
+                leaf_payload.as_bytes(),
+                INTERNAL_HASH_HEX_LEN,
+            )
+        })
+        .collect();
+
+    // Always domain-separate 1-entry directories with NODE_ODD: + ROOT_FINAL:<leaf_count>:<root>
+    if current_level.len() == 1 {
+        let single = current_level.remove(0);
+        let single_combined = ZeroizingString::new(format!("NODE_ODD:{}", single.as_str()));
+        let single_node = hash_domain_bytes_xof(
+            profile,
+            OBJ_DOMAIN_MERKLE_NODE,
+            single_combined.as_bytes(),
+            INTERNAL_HASH_HEX_LEN,
+        );
+        let root_payload =
+            ZeroizingString::new(format!("ROOT_FINAL:{}:{}", leaf_count, single_node.as_str()));
+        return hash_domain_bytes_xof(
+            profile,
+            OBJ_DOMAIN_DIR_ROOT,
+            root_payload.as_bytes(),
+            final_char_len,
+        );
     }
 
-    while hashes.len() > 1 {
-        let mut next_level = Vec::with_capacity((hashes.len() + 1) / 2);
-        for chunk in hashes.chunks(2) {
+    while current_level.len() > 1 {
+        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+        for chunk in current_level.chunks(2) {
             if chunk.len() == 2 {
-                let combined = format!("NODE:{}:{}", chunk[0], chunk[1]);
-                next_level.push(hash_bytes_xof(
-                    mode,
+                let combined =
+                    ZeroizingString::new(format!("NODE:{}:{}", chunk[0].as_str(), chunk[1].as_str()));
+                next_level.push(hash_domain_bytes_xof(
+                    profile,
+                    OBJ_DOMAIN_MERKLE_NODE,
                     combined.as_bytes(),
                     INTERNAL_HASH_HEX_LEN,
                 ));
             } else {
-                let combined = format!("NODE_ODD:{}", chunk[0]);
-                next_level.push(hash_bytes_xof(
-                    mode,
+                let combined = ZeroizingString::new(format!("NODE_ODD:{}", chunk[0].as_str()));
+                next_level.push(hash_domain_bytes_xof(
+                    profile,
+                    OBJ_DOMAIN_MERKLE_NODE,
                     combined.as_bytes(),
                     INTERNAL_HASH_HEX_LEN,
                 ));
             }
         }
-        hashes = next_level;
+        current_level = next_level;
     }
 
-    let root = hashes.remove(0);
-    let root_payload = format!("ROOT_FINAL:{}", root);
-    hash_bytes_xof(mode, root_payload.as_bytes(), final_char_len)
+    // Step 2 (Fix 1.3): Include total leaf count in final root digest under `OBJ_DOMAIN_DIR_ROOT` (0x03).
+    let root = current_level.remove(0);
+    let root_payload = ZeroizingString::new(format!("ROOT_FINAL:{}:{}", leaf_count, root.as_str()));
+    hash_domain_bytes_xof(
+        profile,
+        OBJ_DOMAIN_DIR_ROOT,
+        root_payload.as_bytes(),
+        final_char_len,
+    )
 }
 
 // ========================================================================
@@ -675,13 +1705,21 @@ fn is_valid_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn parse_prefixed_usize(lower: &str, prefixes: &[&str]) -> Option<Result<usize, String>> {
+fn parse_prefixed_usize(
+    raw: &str,
+    lower: &str,
+    prefixes: &[&str],
+) -> Option<Result<usize, String>> {
     for prefix in prefixes {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            return Some(
-                rest.parse::<usize>()
-                    .map_err(|_| format!("invalid numeric value for '{}': '{}'", prefix, rest)),
-            );
+        if lower.starts_with(prefix) {
+            let rest = &raw[prefix.len()..];
+            return Some(rest.parse::<usize>().map_err(|_| {
+                format!(
+                    "invalid numeric value for '{}': '{}'",
+                    prefix,
+                    sanitize_display(rest)
+                )
+            }));
         }
     }
     None
@@ -700,13 +1738,19 @@ fn print_usage() {
     println!("  /paranoid | /standard : profile (default: /paranoid, c=1536, r=64; /standard: c=1024, r=576)");
     println!("  /folder               : hash directory contents");
     println!("  /usemerkletree        : compute Merkle root (requires /folder)");
-    println!("  /check                : verify <path> against <expected_hash> (strict positional order)");
-    println!("  /len:<N>              : explicit output/expected hex length (1..={}, min {} in /check)", MAX_OUTPUT_HEX_LEN, MIN_CHECK_HEX_LEN);
-    println!("  /maxdepth:<N>         : max directory traversal depth (default: {})", DEFAULT_MAX_DEPTH);
+    println!("  /check                : verify <path> against <expected_hash> (defaults strictly to {} chars unless /len:<N> is set)", INTERNAL_HASH_HEX_LEN);
+    println!(
+        "  /len:<N>              : explicit even output/expected hex length ({}..={}, even only)",
+        MIN_CHECK_HEX_LEN, MAX_OUTPUT_HEX_LEN
+    );
+    println!(
+        "  /maxdepth:<N>         : max directory traversal depth (default: {})",
+        DEFAULT_MAX_DEPTH
+    );
     println!("  --                    : end of flags; treat all remaining arguments as positional");
 }
 
-fn verify_or_print(computed: &str, check_mode: bool, expected_hash: Option<String>) {
+fn verify_or_print(computed: &str, check_mode: bool, expected_hash: Option<ZeroizingString>) {
     if check_mode {
         let expected = match expected_hash {
             Some(h) => h,
@@ -720,10 +1764,18 @@ fn verify_or_print(computed: &str, check_mode: bool, expected_hash: Option<Strin
         };
 
         if constant_time_eq(computed.as_bytes(), expected.as_bytes()) {
-            println!("{} [OK] Hash matches! {}{}", COLOR_GREEN, computed, COLOR_RESET);
+            println!(
+                "{} [OK] Hash matches! {}{}",
+                COLOR_GREEN, computed, COLOR_RESET
+            );
         } else {
             eprintln!("{} [FAIL] Hash mismatch! {}", COLOR_RED, COLOR_RESET);
-            eprintln!("{}Expected: {}{}", COLOR_CYAN, expected, COLOR_RESET);
+            eprintln!(
+                "{}Expected: {}{}",
+                COLOR_CYAN,
+                sanitize_display(expected.as_str()),
+                COLOR_RESET
+            );
             eprintln!("{}Computed: {}{}", COLOR_RED, computed, COLOR_RESET);
             std::process::exit(1);
         }
@@ -783,20 +1835,18 @@ fn main() {
                 }
 
                 if let Some(parsed) = parse_prefixed_usize(
+                    s,
                     &lower,
                     &["/len:", "--len:", "-len:", "/len=", "--len=", "-len="],
                 ) {
                     match parsed {
-                        Ok(n) if (1..=MAX_OUTPUT_HEX_LEN).contains(&n) => {
+                        Ok(n) => {
+                            if let Err(msg) = validate_output_hex_len(n) {
+                                eprintln!("{}Error: /len: {}{}", COLOR_RED, msg, COLOR_RESET);
+                                std::process::exit(1);
+                            }
                             explicit_len = Some(n);
                             continue;
-                        }
-                        Ok(n) => {
-                            eprintln!(
-                                "{}Error: /len must be between 1 and {} (got {}).{}",
-                                COLOR_RED, MAX_OUTPUT_HEX_LEN, n, COLOR_RESET
-                            );
-                            std::process::exit(1);
                         }
                         Err(msg) => {
                             eprintln!("{}Error: {}{}", COLOR_RED, msg, COLOR_RESET);
@@ -806,6 +1856,7 @@ fn main() {
                 }
 
                 if let Some(parsed) = parse_prefixed_usize(
+                    s,
                     &lower,
                     &[
                         "/maxdepth:",
@@ -833,6 +1884,14 @@ fn main() {
         positional.push(arg);
     }
 
+    let profile = match Profile::from_str(mode) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{}Error: {}{}", COLOR_RED, msg, COLOR_RESET);
+            std::process::exit(1);
+        }
+    };
+
     if merkle_mode && !folder_mode {
         eprintln!(
             "{}Error: /usemerkletree can only be used with /folder.{}",
@@ -842,7 +1901,7 @@ fn main() {
     }
 
     let target_path: PathBuf;
-    let expected_hash: Option<String>;
+    let expected_hash: Option<ZeroizingString>;
     let char_len: usize;
 
     if check_mode {
@@ -876,55 +1935,40 @@ fn main() {
             std::process::exit(1);
         }
 
-        if expected_str.len() < MIN_CHECK_HEX_LEN {
+        if let Err(msg) = validate_output_hex_len(expected_str.len()) {
             eprintln!(
-                "{}Error: /check requires a hash of at least {} hex characters ({} bits) to prevent truncation downgrades.{}",
-                COLOR_RED,
-                MIN_CHECK_HEX_LEN,
-                MIN_CHECK_HEX_LEN * 4,
-                COLOR_RESET
+                "{}Error in /check expected hash: {}.{}",
+                COLOR_RED, msg, COLOR_RESET
             );
             std::process::exit(1);
         }
 
-        if expected_str.len() > MAX_OUTPUT_HEX_LEN {
-            eprintln!(
-                "{}Error: expected hash length ({}) exceeds maximum allowed ({} hex chars).{}",
-                COLOR_RED,
-                expected_str.len(),
-                MAX_OUTPUT_HEX_LEN,
-                COLOR_RESET
-            );
-            std::process::exit(1);
-        }
-
-        if let Some(req_len) = explicit_len {
-            if req_len < MIN_CHECK_HEX_LEN {
-                eprintln!(
-                    "{}Error: /len in /check mode must be at least {} hex characters ({} bits).{}",
-                    COLOR_RED,
-                    MIN_CHECK_HEX_LEN,
-                    MIN_CHECK_HEX_LEN * 4,
-                    COLOR_RESET
-                );
-                std::process::exit(1);
-            }
-            if expected_str.len() != req_len {
+        // Fix 2.1: Require explicit /len:<N> for non-default lengths; otherwise default
+        // strictly to the canonical 128-char (512-bit) digest length.
+        let required_len = explicit_len.unwrap_or(INTERNAL_HASH_HEX_LEN);
+        if expected_str.len() != required_len {
+            if explicit_len.is_some() {
                 eprintln!(
                     "{}Error: expected hash length ({}) does not match explicit /len:{} requirement.{}",
                     COLOR_RED,
                     expected_str.len(),
-                    req_len,
+                    required_len,
                     COLOR_RESET
                 );
-                std::process::exit(1);
+            } else {
+                eprintln!(
+                    "{}Error: /check defaults strictly to the canonical {}-char (512-bit) digest length (got {} chars). Pass /len:{} explicitly to verify a non-default digest length.{}",
+                    COLOR_RED,
+                    INTERNAL_HASH_HEX_LEN,
+                    expected_str.len(),
+                    expected_str.len(),
+                    COLOR_RESET
+                );
             }
-            char_len = req_len;
-        } else {
-            char_len = expected_str.len();
+            std::process::exit(1);
         }
-
-        expected_hash = Some(expected_str.to_ascii_lowercase());
+        char_len = required_len;
+        expected_hash = Some(ZeroizingString::new(expected_str.to_ascii_lowercase()));
     } else {
         if positional.is_empty() || positional.len() > 2 {
             eprintln!(
@@ -951,45 +1995,34 @@ fn main() {
             }
 
             let len_arg = &positional[1];
-            let parsed_len = len_arg
-                .to_str()
-                .and_then(|s| s.parse::<usize>().ok());
+            let parsed_len = len_arg.to_str().and_then(|s| s.parse::<usize>().ok());
 
             match parsed_len {
-                Some(n) if (1..=MAX_OUTPUT_HEX_LEN).contains(&n) => char_len = n,
                 Some(n) => {
-                    eprintln!(
-                        "{}Error: output_length must be between 1 and {} (got {}).{}",
-                        COLOR_RED, MAX_OUTPUT_HEX_LEN, n, COLOR_RESET
-                    );
-                    std::process::exit(1);
+                    if let Err(msg) = validate_output_hex_len(n) {
+                        eprintln!("{}Error: {}{}", COLOR_RED, msg, COLOR_RESET);
+                        std::process::exit(1);
+                    }
+                    char_len = n;
                 }
                 None => {
                     eprintln!(
-                        "{}Error: invalid output_length '{}'. Use /len:<N> or a positive integer.{}",
+                        "{}Error: invalid output_length '{}'. Use /len:<N> or an even integer ({}..={}).{}",
                         COLOR_RED,
-                        Path::new(len_arg).display(),
+                        sanitize_path_display(Path::new(len_arg)),
+                        MIN_CHECK_HEX_LEN,
+                        MAX_OUTPUT_HEX_LEN,
                         COLOR_RESET
                     );
                     std::process::exit(1);
                 }
             }
         } else {
-            char_len = explicit_len.unwrap_or(64);
+            char_len = explicit_len.unwrap_or(INTERNAL_HASH_HEX_LEN);
         }
     }
 
     if folder_mode {
-        if !target_path.is_dir() {
-            eprintln!(
-                "{}Error: not a valid directory: {}{}",
-                COLOR_RED,
-                target_path.display(),
-                COLOR_RESET
-            );
-            std::process::exit(1);
-        }
-
         let mut stats = DirStats {
             file_count: 0,
             dir_count: 0,
@@ -999,15 +2032,25 @@ fn main() {
         };
         let mut leaf_hashes = Vec::new();
 
-        if let Err(e) =
-            collect_directory_entries(&target_path, mode, max_depth, &mut stats, &mut leaf_hashes)
-        {
-            eprintln!("{}Error scanning directory: {}{}", COLOR_RED, e, COLOR_RESET);
+        if let Err(e) = collect_directory_entries(
+            &target_path,
+            profile,
+            max_depth,
+            &mut stats,
+            &mut leaf_hashes,
+        ) {
+            eprintln!(
+                "{}Error scanning directory '{}': {}{}",
+                COLOR_RED,
+                sanitize_path_display(&target_path),
+                sanitize_display(&e.to_string()),
+                COLOR_RESET
+            );
             std::process::exit(1);
         }
 
         let digest = if merkle_mode {
-            compute_merkle_root(mode, leaf_hashes, char_len)
+            compute_merkle_root(profile, leaf_hashes, char_len)
         } else {
             let mut manifest = format!(
                 "MANIFEST:{}:{}:{}:{}:{}\n",
@@ -1018,10 +2061,16 @@ fn main() {
                 stats.total_size
             );
             for h in &leaf_hashes {
-                manifest.push_str(h);
+                manifest.push_str(h.as_str());
                 manifest.push('\n');
             }
-            hash_bytes_xof(mode, manifest.as_bytes(), char_len)
+            let manifest_zeroizing = ZeroizingString::new(manifest);
+            hash_domain_bytes_xof(
+                profile,
+                OBJ_DOMAIN_DIR_ROOT,
+                manifest_zeroizing.as_bytes(),
+                char_len,
+            )
         };
 
         if !check_mode {
@@ -1030,7 +2079,11 @@ fn main() {
             } else {
                 "Directory Content Hash"
             };
-            println!("=== {}: {} ===", label, target_path.display());
+            println!(
+                "=== {}: {} ===",
+                label,
+                sanitize_path_display(&target_path)
+            );
             println!(
                 "Files: {}, Folders: {}, Symlinks: {}, Special: {}, Total size: {} bytes",
                 stats.file_count,
@@ -1041,24 +2094,22 @@ fn main() {
             );
         }
 
-        verify_or_print(&digest, check_mode, expected_hash);
+        verify_or_print(digest.as_str(), check_mode, expected_hash);
         return;
     }
 
-    if !target_path.is_file() {
-        eprintln!(
-            "{}Error: file not found: {}{}",
-            COLOR_RED,
-            target_path.display(),
-            COLOR_RESET
-        );
-        std::process::exit(1);
-    }
-
-    match run_hash(mode, &target_path, char_len) {
-        Ok((computed, _bytes_hashed)) => verify_or_print(&computed, check_mode, expected_hash),
+    match run_hash(profile, &target_path, char_len) {
+        Ok((computed, _bytes_hashed)) => {
+            verify_or_print(computed.as_str(), check_mode, expected_hash)
+        }
         Err(e) => {
-            eprintln!("{}Error reading target file: {}{}", COLOR_RED, e, COLOR_RESET);
+            eprintln!(
+                "{}Error reading target file '{}': {}{}",
+                COLOR_RED,
+                sanitize_path_display(&target_path),
+                sanitize_display(&e.to_string()),
+                COLOR_RESET
+            );
             std::process::exit(1);
         }
     }
